@@ -1,7 +1,7 @@
 /**
- * Inline: select a passage in a reply, right-click, and write a prompt. The
- * passage becomes a link; hover it and the agent's answer opens in a card at
- * the passage, the way Obsidian's page preview does. Links inside a card open
+ * Inline: select a passage in a reply, click the comment icon that appears
+ * by it, and write a prompt. The passage becomes a link; hover it and the
+ * agent's answer opens in a card at the passage. Links inside a card open
  * their own cards.
  *
  * Inline only changes how the chat is shown. A prompt is sent through the
@@ -13,7 +13,6 @@
  * and shows the answer at the passage instead, so links appear on any device
  * and in any chat that has them. The only thing stored is a hint that tells
  * repeats of the same passage apart.
-
  *
  * Links are drawn with the CSS Custom Highlight API; the transcript DOM is
  * never modified beyond an attribute on each turn it hides.
@@ -29,12 +28,11 @@ const STREAMING = '[data-message-streaming="true"]'
 const ALERT = '[data-slot="aui_assistant-message-content"] [role="alert"]'
 const STOPPED = '[data-slot="aui_assistant-message-stopped"]'
 const ASSISTANT = '[data-role="assistant"]'
-// A chat surface: one chat and its own message box (the primary, or a tile).
-const SURFACE_ROOT = '[data-composer-target]'
+// One chat and its own message box (the main one, or a tile).
+const CHAT_SURFACE = '[data-composer-target]'
 const ATTACHMENTS = '[data-slot="composer-attachments"]'
 const TURN_ATTR = 'data-hm-turn'
 const PAGE_ATTR = 'data-hm-page'
-const OWN_MENU_ATTR = 'data-hermes-context-menu-trigger'
 const CONTEXT_CHARS = 40
 const MAX_HINTS = 500
 const SEND_TIMEOUT_MS = 20 * 1000
@@ -47,21 +45,22 @@ const CLOSERS = Object.fromEntries(Object.entries(PAIRS).map(([open, close]) => 
 
 // The app's floating-list surface (src/components/ui/menu.ts), so popovers
 // read like its own menus.
-const SURFACE =
+const POPOVER =
   'rounded-lg border border-(--ui-stroke-secondary) bg-[color-mix(in_srgb,var(--ui-bg-elevated)_96%,transparent)] text-popover-foreground shadow-md backdrop-blur-md'
 
 const CSS_TEXT = `
 [${TURN_ATTR}] { display: none !important; }
 /* Like a commented passage in Google Docs: the words themselves are tinted,
-   more strongly while their card is open. Accent blue, so it never reads as a
-   selection (the app selects in yellow) or as a web link (blue text). */
+   in the theme's accent. Grey while the answer is on its way, light once
+   there is a conversation, strong for the one you're on. A tint never
+   reads as a selection (the app selects in yellow in every theme) or as a web
+   link (coloured text). */
 ::highlight(hm-link) { background-color: color-mix(in srgb, var(--ui-accent) 22%, transparent); }
 ::highlight(hm-wait) { background-color: color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent); }
-::highlight(hm-open), ::highlight(hm-hover) { background-color: color-mix(in srgb, var(--ui-accent) 34%, transparent); }
-::highlight(hm-draft) { background-color: color-mix(in srgb, var(--ui-accent) 18%, transparent); }
+/* The passage you're on right now: writing its prompt, hovering it, or its card open. */
+::highlight(hm-draft), ::highlight(hm-open), ::highlight(hm-hover) { background-color: color-mix(in srgb, var(--ui-accent) 34%, transparent); }
 /* A link whose answer just arrived glows once; --hm-ready-a is driven from JS. */
 ::highlight(hm-ready) { background-color: color-mix(in srgb, var(--ui-accent) var(--hm-ready-a, 0%), transparent); }
-.hm-hover, .hm-hover * { cursor: pointer !important; }
 .hm-layer { position: fixed; inset: 0; pointer-events: none; z-index: 60; }
 .hm-pop { position: fixed; pointer-events: auto; box-sizing: border-box;
   font-size: var(--conversation-text-font-size, 13px); }
@@ -86,7 +85,13 @@ const CSS_TEXT = `
 .hm-card-actions:empty { display: none; }
 .hm-card-action { all: unset; cursor: pointer; font-size: 11px; line-height: 20px; color: var(--ui-text-tertiary); }
 .hm-card-action:hover { color: var(--ui-text-secondary); }
-/* The prompt box is the card's label row being written: same icon, same place. */
+/* The way in: a comment icon off the corner where the selection ends. */
+.hm-offer { position: fixed; pointer-events: auto; width: 24px; height: 24px; padding: 0; display: grid; place-items: center;
+  cursor: pointer; color: var(--ui-text-tertiary); animation: hm-pop-in 140ms ease-out; transform-origin: top left; }
+.hm-offer[hidden] { display: none; }
+.hm-offer:hover { color: var(--ui-text-primary); }
+.hm-offer .codicon { font-size: 13px; }
+/* The prompt box is the card's label row being written: the same icon, then your words. */
 .hm-ask { width: 340px; display: flex; align-items: flex-start; gap: 6px; padding: 7px 10px; }
 .hm-ask .codicon { flex: none; font-size: 14px; line-height: 1.5; color: var(--ui-text-tertiary); }
 .hm-ask-field { all: unset; box-sizing: border-box; display: block; flex: 1; min-width: 0; min-height: 20px; max-height: 120px;
@@ -285,6 +290,18 @@ function rangeHit(range, x, y) {
   return false
 }
 
+/**
+ * Diagonally off the bottom-right corner of a range, where the pointer ends
+ * a selection: the comment icon sits here, clear of the selected words and
+ * a few pixels apart so the two don't merge, and the prompt box opens from
+ * the same spot.
+ */
+function endOf(range) {
+  const last = [...range.getClientRects()].filter(r => r.width).at(-1)
+
+  return last ? { left: last.right + 4, top: last.bottom + 4 } : null
+}
+
 /** Place a popover under (or above) a rect, inside the window. */
 function place(pop, rect) {
   const w = pop.offsetWidth
@@ -330,8 +347,10 @@ function snapSpan(text, s, t) {
 }
 
 /** Elements on screen: the app keeps chats you switched away from mounted in
- *  hidden panes, and a link must never land in one of those. */
-const shown = el => !el.closest('[inert], [aria-hidden="true"], [data-pane-hidden]')
+ *  hidden panes (marked like this), and a link must never land in one of
+ *  those. Not aria-hidden: the app sets that on everything behind an open
+ *  menu, which would make every link blink off while one is open. */
+const shown = el => !el.closest('[inert], [data-pane-hidden]')
 
 /** A reply's own text: its Markdown blocks, not its thinking or tool rows. */
 const answerBlocks = group =>
@@ -344,7 +363,7 @@ const answerBlocks = group =>
 export default {
   id: 'inline',
   name: 'Inline',
-  description: 'Select text in a reply, right-click and write a prompt: the answer opens at the passage.',
+  description: 'Comment on any part of a reply. Select the words, click the comment icon, and the answer appears on those words.',
 
   register(ctx) {
     const state = host.state
@@ -458,11 +477,7 @@ export default {
             const key = promptKey(parsed.quote, parsed.prompt)
             const n = (seen.get(key) ?? 0) + 1
             const earlier = [...replies, ...answers]
-            const hit = findQuote(
-              earlier.map(r => r.index),
-              parsed.quote,
-              hints[key]
-            )
+            const hit = findQuote(earlier.map(r => r.index), parsed.quote, hints[key])
 
             seen.set(key, n)
             counts.set(key, (counts.get(key) ?? 0) + 1)
@@ -498,16 +513,12 @@ export default {
 
       // A prompt that reached the chat is a link now (or, if its passage
       // can't be found, an ordinary message).
-      let arrived = false
-
       for (const a of [...asks]) {
         if (a.sent && (counts.get(a.key) ?? 0) > a.before) {
           asks.splice(asks.indexOf(a), 1)
           a.cancel?.()
-          arrived = true
         }
       }
-      if (arrived) pumpSoon()
 
       for (const link of found) {
         if (statusSeen.get(link.id) === 'wait' && link.status === 'done') glow(link.id)
@@ -581,6 +592,9 @@ export default {
       for (const card of cards) card.range = anchored.find(a => a.link?.id === card.link.id)?.range ?? card.range
       hovered = (hovered && anchored.find(a => a.link && a.link.id === hovered.link.id)) || null
       setHover(hovered)
+      placeOffer()
+      // Waiting prompts are tried after every paint: a chat went idle, came
+      // into view, or its message box lost its attachments.
       if (asks.some(a => !a.sent)) pumpSoon()
     }
 
@@ -660,7 +674,6 @@ export default {
       }
       asks.push({ text, key, range, sid: lastFocus.runtime, stored: lastFocus.stored, sent: false })
       paint()
-      pump()
     }
 
     function dropAsk(a, message) {
@@ -673,10 +686,10 @@ export default {
       paint()
     }
 
-    /** The chat surface (a chat and its message box) a prompt goes through: its tile, else the main one. */
+    /** The chat and message box a prompt goes through: its tile, else the main one. */
     const surfaceOf = a =>
-      (a.stored && document.querySelector(`${SURFACE_ROOT}[data-session-anchor="session-tile:${CSS.escape(a.stored)}"]`)) ||
-      document.querySelector(`${SURFACE_ROOT}[data-composer-target="main"]`)
+      (a.stored && document.querySelector(`${CHAT_SURFACE}[data-session-anchor="session-tile:${CSS.escape(a.stored)}"]`)) ||
+      document.querySelector(`${CHAT_SURFACE}[data-composer-target="main"]`)
 
     /**
      * Send the next prompt through its chat's own message box, exactly as if
@@ -702,18 +715,14 @@ export default {
           continue
         }
         Object.assign(next, { sent: true, before })
-        next.cancel = ctx.setTimeout(() => {
-          dropAsk(next, "Hermes didn't take the prompt.")
-          pump()
-        }, SEND_TIMEOUT_MS)
+        next.cancel = ctx.setTimeout(() => dropAsk(next, "Hermes didn't take the prompt."), SEND_TIMEOUT_MS)
 
         return
       }
     }
 
-    // After the app has re-rendered for the change that called it (a chat
-    // going idle, another chat coming into view): the message box acts on
-    // its last render, and before that it would still see the old state.
+    // A frame later, so the app has re-rendered for whatever changed: its
+    // message box acts on its last render and would still see the old state.
     let pumpFrame = 0
 
     function pumpSoon() {
@@ -724,14 +733,9 @@ export default {
       })
     }
 
-    // A chat going idle is the moment to send its waiting prompt; it also
-    // settles links (no reply came = no answer).
-    ctx.onDispose(
-      state.busyBySession.listen(() => {
-        pumpSoon()
-        schedulePaint()
-      })
-    )
+    // A chat going idle settles its links (no reply came = no answer) and
+    // lets its waiting prompt go.
+    ctx.onDispose(state.busyBySession.listen(schedulePaint))
 
     /** The message for a prompt, and its hint for telling repeats of the passage apart. */
     function prepare(quote, prompt, hint) {
@@ -790,7 +794,12 @@ export default {
       if (link.status === 'wait') body.append(element('div', 'hm-card-wait'))
       else if (link.status === 'error') {
         body.append(element('div', 'hm-card-note', link.error ? `No answer: ${link.error}` : 'No answer arrived.'))
-        actions.append(action('Retry', () => queueAsk(link.text, link.key, null)))
+        actions.append(
+          action('Retry', () => {
+            closeCards(cards.indexOf(card))
+            queueAsk(link.text, link.key, null)
+          })
+        )
       } else if (link.error) body.append(element('div', 'hm-card-note', link.error))
       else if (link.stopped) body.append(element('div', 'hm-card-note', 'Stopped before it finished.'))
       if (card.pop.isConnected) place(card.pop, card.range.getBoundingClientRect())
@@ -808,7 +817,7 @@ export default {
 
     function openCard(depth, hit) {
       dropCards(depth)
-      const pop = element('div', `hm-pop hm-card ${SURFACE}`)
+      const pop = element('div', `hm-pop hm-card ${POPOVER}`)
       // Hermes's own edge fade (the utility behind FadeScroll): a clipped edge
       // fades out while there is more to scroll, and a short answer shows none.
       const body = element('div', 'hm-card-body scroll-fade-y')
@@ -849,7 +858,8 @@ export default {
         }
         place(cards[i].pop, rect)
       }
-      if (ask) place(ask.pop, ask.range.getBoundingClientRect())
+      if (ask) placeAsk()
+      placeOffer()
     }
 
     // ----- hover: open after a pause, close after leaving -----
@@ -911,7 +921,6 @@ export default {
     function setHover(hit) {
       hl['hm-hover'].clear()
       if (hit) hl['hm-hover'].add(hit.range)
-      document.documentElement.classList.toggle('hm-hover', Boolean(hit))
     }
 
     function pointer(x, y, target) {
@@ -954,7 +963,7 @@ export default {
       document,
       'mousedown',
       e => {
-        if (ask?.pop.contains(e.target)) return
+        if (ask?.pop.contains(e.target) || offer.contains(e.target)) return
         closeAsk()
         // A press on a link leaves its card as it is.
         if (e.button === 0 && hitAt(e.clientX, e.clientY)) return
@@ -988,7 +997,24 @@ export default {
     ctx.addEventListener(document, 'scroll', reposition, true)
     ctx.addEventListener(window, 'resize', reposition)
 
-    // ----- ask box (right-click on a selection) -----
+    // ----- asking: the comment icon by a selection, then the prompt box -----
+
+    /**
+     * The box opens from the comment icon's spot: its own icon in line with
+     * the clicked one (6px left, for the box's border and padding), its top
+     * just clear of the line with the passage.
+     */
+    function placeAsk() {
+      const at = endOf(ask.range)
+
+      if (!at) return
+      const { offsetWidth: w, offsetHeight: h } = ask.pop
+      let top = at.top
+
+      if (top + h > window.innerHeight - 8) top = ask.range.getBoundingClientRect().top - h - 6
+      ask.pop.style.left = `${Math.min(Math.max(8, at.left - 6), window.innerWidth - w - 8)}px`
+      ask.pop.style.top = `${Math.max(8, top)}px`
+    }
 
     function closeAsk() {
       if (!ask) return
@@ -1001,7 +1027,7 @@ export default {
       closeAsk()
       cancelOpen()
       cancelClose()
-      const pop = element('div', `hm-pop hm-ask ${SURFACE}`)
+      const pop = element('div', `hm-pop hm-ask ${POPOVER}`)
       const field = element('div', 'hm-ask-field')
 
       field.contentEditable = 'plaintext-only'
@@ -1026,7 +1052,7 @@ export default {
       layer.append(pop)
       hl['hm-draft'].add(range)
       ask = { pop, range }
-      place(pop, range.getBoundingClientRect())
+      placeAsk()
       field.focus()
     }
 
@@ -1040,83 +1066,96 @@ export default {
       if (page) return { scope: page, index: () => buildIndex([page]) }
       const group = el.closest(GROUP)
 
-      if (!group?.closest(THREAD) || !replyOf(group).blocks.some(b => b.contains(el))) return null
+      if (!group?.closest(THREAD) || !shown(group) || !replyOf(group).blocks.some(b => b.contains(el))) return null
 
       return { scope: group, index: () => replyOf(group).index() }
     }
 
-    /** The selection under (x, y) inside one reply or one card, if any. */
-    function selectionAt(x, y) {
+    /** The selection, when it lies inside one reply or one card. */
+    function replySelection() {
       const sel = window.getSelection()
 
       if (!sel || sel.isCollapsed || !sel.rangeCount) return null
       const range = sel.getRangeAt(0)
       const root = textRoot(range.startContainer)
 
-      if (!root || !root.scope.contains(range.endContainer)) return null
-
-      return rangeHit(range, x, y) ? { sel, range, ...root } : null
+      return root && root.scope.contains(range.endContainer) ? { sel, range, ...root } : null
     }
 
-    // The app's window-level contextmenu handler opens its own menu (just
-    // "Copy" for a selection) and stops the event before it reaches us. It
-    // steps aside for elements marked as owning their menu, so mark the
-    // element under the pointer on the right-button mousedown that precedes
-    // contextmenu, and only when that press is on a selection we handle.
-    let marked = null
-    const unmark = () => {
-      marked?.removeAttribute(OWN_MENU_ATTR)
-      marked = null
+    /** Snap the selection to whole words and open the prompt box on it. */
+    function askAbout({ sel, range, index }) {
+      const idx = index()
+      const [s, t] = snapSpan(
+        idx.text,
+        indexAt(idx, range.startContainer, range.startOffset),
+        indexAt(idx, range.endContainer, range.endOffset)
+      )
+
+      if (t <= s) return
+      const snapped = rangeFor(idx, s, t)
+
+      sel.removeAllRanges()
+      sel.addRange(snapped)
+      openAsk({
+        quote: quoteOf(idx, s, t),
+        range: snapped.cloneRange(),
+        hint: { prefix: idx.text.slice(Math.max(0, s - CONTEXT_CHARS), s), suffix: idx.text.slice(t, t + CONTEXT_CHARS) }
+      })
     }
 
-    ctx.addEventListener(
-      window,
-      'mousedown',
-      e => {
-        unmark()
-        const secondary = e.button === 2 || (e.button === 0 && e.ctrlKey)
+    // The comment icon appears off the corner where the selection ends, which
+    // is where a drag or double-click leaves the pointer, once the drag is
+    // over. Clicking it opens the prompt box from the same spot; a selection
+    // made only to copy just leaves it alone.
+    const offer = element('button', `hm-offer ${POPOVER}`)
+    let dragging = false
 
-        if (!secondary || !(e.target instanceof Element) || e.target.hasAttribute(OWN_MENU_ATTR)) return
-        if (!selectionAt(e.clientX, e.clientY)) return
-        marked = e.target
-        marked.setAttribute(OWN_MENU_ATTR, '')
-        ctx.setTimeout(unmark, 1000)
-      },
-      true
-    )
-    ctx.onDispose(unmark)
+    offer.type = 'button'
+    offer.setAttribute('aria-label', 'Ask about the selected words')
+    offer.hidden = true
+    offer.append(element('span', 'codicon codicon-comment'))
+    layer.append(offer)
+    // Pressing it must not clear the selection it acts on.
+    offer.addEventListener('mousedown', e => e.preventDefault())
+    offer.addEventListener('click', e => {
+      e.stopPropagation()
+      const hit = replySelection()
 
+      if (hit) askAbout(hit)
+    })
+
+    // While one of the app's menus is open (right-click → Copy) the icon
+    // steps aside, and comes back when the menu closes.
+    function placeOffer() {
+      const range = dragging || ask || document.querySelector('[role="menu"]') ? null : replySelection()?.range
+      const at = range && endOf(range)
+
+      offer.hidden = !at
+      if (!at) return
+      offer.style.left = `${Math.max(4, Math.min(at.left, window.innerWidth - 28))}px`
+      offer.style.top = `${at.top}px`
+    }
+
+    ctx.addEventListener(document, 'selectionchange', placeOffer)
+    ctx.addEventListener(document, 'contextmenu', () => (offer.hidden = true), true)
     ctx.addEventListener(
       document,
-      'contextmenu',
+      'mousedown',
       e => {
-        unmark()
-        const hit = selectionAt(e.clientX, e.clientY)
-
-        if (!hit) return
-        const { sel, range } = hit
-        const idx = hit.index()
-        const [s, t] = snapSpan(
-          idx.text,
-          indexAt(idx, range.startContainer, range.startOffset),
-          indexAt(idx, range.endContainer, range.endOffset)
-        )
-
-        if (t <= s) return
-        const snapped = rangeFor(idx, s, t)
-
-        e.preventDefault()
-        e.stopPropagation()
-        sel.removeAllRanges()
-        sel.addRange(snapped)
-        openAsk({
-          quote: quoteOf(idx, s, t),
-          range: snapped.cloneRange(),
-          hint: { prefix: idx.text.slice(Math.max(0, s - CONTEXT_CHARS), s), suffix: idx.text.slice(t, t + CONTEXT_CHARS) }
-        })
+        if (e.button === 0 && !offer.contains(e.target)) dragging = true
       },
       true
     )
+    ctx.addEventListener(
+      document,
+      'mouseup',
+      () => {
+        dragging = false
+        placeOffer()
+      },
+      true
+    )
+
 
     for (const store of [state.focusedStoredSessionId, state.focusedSessionId]) {
       ctx.onDispose(
@@ -1129,7 +1168,6 @@ export default {
             dropCards(0)
           }
           schedulePaint()
-          pumpSoon()
         })
       )
     }
@@ -1147,7 +1185,6 @@ export default {
       // Only ours: during a reload the next copy may have taken these over already.
       for (const name of HL) if (CSS.highlights.get(name) === hl[name]) CSS.highlights.delete(name)
       for (const group of document.querySelectorAll(`[${TURN_ATTR}="${instance}"]`)) group.removeAttribute(TURN_ATTR)
-      document.documentElement.classList.remove('hm-hover')
       layer.remove()
       style.remove()
       ticks.remove()
