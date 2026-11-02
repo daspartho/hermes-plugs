@@ -1,33 +1,46 @@
 /**
- * Inline: select a passage in a reply, right-click, and type a question. The
- * passage becomes a link (grey while the answer is on its way, accent when
- * it's ready). Hover a link and its answer opens in a card at the link, the
- * way Obsidian's page preview does; links inside a card open their own cards.
- * Clicking a link, or pressing inside its card, keeps the card open.
+ * Inline: select a passage in a reply, right-click, and write a prompt. The
+ * passage becomes a link; hover it and the agent's answer opens in a card at
+ * the passage, the way Obsidian's page preview does. Links inside a card open
+ * their own cards.
  *
- * Each question is a real turn of the main conversation: it is sent with
- * `prompt.submit` and `display_kind: 'hidden'`, so the agent keeps it (and its
- * answer) in context for everything after. Only the display differs: the
- * hidden user row never renders, and this plugin hides the reply bubble and
- * shows the answer at the passage instead.
+ * Inline only changes how the chat is shown. A prompt is sent through the
+ * message box as an ordinary quote-reply ("> passage", a blank line, the
+ * prompt), so the agent keeps it in context and anyone without Inline sees
+ * the chat as it really is. Inline reads its links back from the chat: a
+ * quote-reply whose passage appears in an earlier reply is a link, and the
+ * reply under it is the link's answer. Inline hides that turn in its own view
+ * and shows the answer at the passage instead, so links appear on any device
+ * and in any chat that has them. The only thing stored is a hint that tells
+ * repeats of the same passage apart.
+
  *
- * Links are drawn with the CSS Custom Highlight API, so the transcript DOM is
- * never modified. Cards reuse the app's menu surface classes.
+ * Links are drawn with the CSS Custom Highlight API; the transcript DOM is
+ * never modified beyond an attribute on each turn it hides.
  */
-import { COMPOSER_AREAS, host, Streamdown, atom, useValue } from '@hermes/plugin-sdk'
-import { useEffect } from 'react'
-import { jsx } from 'react/jsx-runtime'
+import { host } from '@hermes/plugin-sdk'
 
 const THREAD = '[data-slot="aui_thread-content"]'
+const GROUP = '[data-slot="aui_message-group"]'
+const USER_ROOT = '[data-role="user"]'
+const USER_TEXT = '[data-slot="aui_user-message-text"]'
+const THINKING = '[data-slot="aui_thinking-disclosure"]'
+const STREAMING = '[data-message-streaming="true"]'
+const ALERT = '[data-slot="aui_assistant-message-content"] [role="alert"]'
+const STOPPED = '[data-slot="aui_assistant-message-stopped"]'
+const ASSISTANT = '[data-role="assistant"]'
+// A chat surface: one chat and its own message box (the primary, or a tile).
+const SURFACE_ROOT = '[data-composer-target]'
+const ATTACHMENTS = '[data-slot="composer-attachments"]'
+const TURN_ATTR = 'data-hm-turn'
 const PAGE_ATTR = 'data-hm-page'
 const OWN_MENU_ATTR = 'data-hermes-context-menu-trigger'
 const CONTEXT_CHARS = 40
-const TURN_TIMEOUT_MS = 10 * 60 * 1000
+const MAX_HINTS = 500
+const SEND_TIMEOUT_MS = 20 * 1000
 const HOVER_OPEN_MS = 300
 const HOVER_SWITCH_MS = 100
 const HOVER_CLOSE_MS = 300
-const ANSWER_CLASS = 'preview-markdown text-sm text-foreground'
-const ASK_HINTS = ['Dig into this…', 'Pull on this thread…', 'What about this?', 'Go deeper…']
 const BLOCKS = 'p, li, h1, h2, h3, h4, h5, h6, pre, blockquote, td, th, div'
 const PAIRS = { '(': ')', '[': ']', '{': '}', '“': '”', '‘': '’', '"': '"' }
 const CLOSERS = Object.fromEntries(Object.entries(PAIRS).map(([open, close]) => [close, open]))
@@ -38,25 +51,13 @@ const SURFACE =
   'rounded-lg border border-(--ui-stroke-secondary) bg-[color-mix(in_srgb,var(--ui-bg-elevated)_96%,transparent)] text-popover-foreground shadow-md backdrop-blur-md'
 
 const CSS_TEXT = `
-/* Wikipedia-style links: blue text, underline on hover. */
-::highlight(hm-link) { color: var(--ui-accent); }
-::highlight(hm-current) {
-  color: var(--ui-accent);
-  background-color: color-mix(in srgb, var(--ui-accent) 12%, transparent);
-}
-::highlight(hm-pending) {
-  color: var(--ui-text-tertiary);
-  text-decoration-line: underline;
-  text-decoration-style: dotted;
-  text-decoration-thickness: 1px;
-  text-decoration-color: var(--ui-text-tertiary);
-}
-::highlight(hm-hover) {
-  color: var(--ui-accent);
-  text-decoration-line: underline;
-  text-decoration-thickness: 1px;
-  text-decoration-color: var(--ui-accent);
-}
+[${TURN_ATTR}] { display: none !important; }
+/* Like a commented passage in Google Docs: the words themselves are tinted,
+   more strongly while their card is open. Accent blue, so it never reads as a
+   selection (the app selects in yellow) or as a web link (blue text). */
+::highlight(hm-link) { background-color: color-mix(in srgb, var(--ui-accent) 22%, transparent); }
+::highlight(hm-wait) { background-color: color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent); }
+::highlight(hm-open), ::highlight(hm-hover) { background-color: color-mix(in srgb, var(--ui-accent) 34%, transparent); }
 ::highlight(hm-draft) { background-color: color-mix(in srgb, var(--ui-accent) 18%, transparent); }
 /* A link whose answer just arrived glows once; --hm-ready-a is driven from JS. */
 ::highlight(hm-ready) { background-color: color-mix(in srgb, var(--ui-accent) var(--hm-ready-a, 0%), transparent); }
@@ -75,68 +76,77 @@ const CSS_TEXT = `
 .hm-card-question .codicon { flex: none; font-size: 14px; }
 .hm-card-question-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hm-card-body { max-height: min(50vh, 420px); overflow-y: auto; padding: 0 14px; scrollbar-width: thin; }
-.hm-card-body .hm-plain { white-space: pre-wrap; }
-/* List markers sit outside the text; keep them inside the card. */
-.hm-card-body ul, .hm-card-body ol { padding-inline-start: 1.15em; }
+.hm-card-body .aui-md + .aui-md { margin-top: var(--paragraph-gap, 0.75em); }
 .hm-card-wait { height: 2px; margin: 10px 0 12px; border-radius: 1px;
   background: linear-gradient(90deg, transparent, var(--ui-accent), transparent) no-repeat;
   background-size: 40% 100%; animation: hm-wait 1.1s ease-in-out infinite; }
 @keyframes hm-wait { from { background-position: -60% 0; } to { background-position: 160% 0; } }
-.hm-card-error { padding: 2px 0 6px; font-size: 12px; color: var(--ui-text-tertiary); }
+.hm-card-note { padding: 6px 0 4px; font-size: 12px; color: var(--ui-text-tertiary); }
 .hm-card-actions { display: flex; gap: 12px; padding: 4px 14px 2px; }
 .hm-card-actions:empty { display: none; }
 .hm-card-action { all: unset; cursor: pointer; font-size: 11px; line-height: 20px; color: var(--ui-text-tertiary); }
 .hm-card-action:hover { color: var(--ui-text-secondary); }
-.hm-src { position: absolute; left: -10000px; top: 0; width: 412px; visibility: hidden; pointer-events: none; }
-.hm-ask { width: 340px; padding: 7px 10px 6px; }
-.hm-ask-field { all: unset; box-sizing: border-box; display: block; width: 100%; min-height: 20px; max-height: 120px;
+/* The prompt box is the card's label row being written: same icon, same place. */
+.hm-ask { width: 340px; display: flex; align-items: flex-start; gap: 6px; padding: 7px 10px; }
+.hm-ask .codicon { flex: none; font-size: 14px; line-height: 1.5; color: var(--ui-text-tertiary); }
+.hm-ask-field { all: unset; box-sizing: border-box; display: block; flex: 1; min-width: 0; min-height: 20px; max-height: 120px;
   overflow-y: auto; white-space: pre-wrap; word-break: break-word; line-height: 1.5; color: var(--ui-text-primary); }
-.hm-ask-field:empty::before { content: attr(data-placeholder); color: var(--ui-text-tertiary); }
-.hm-ask-hint { margin-top: 2px; font-size: 11px; color: var(--ui-text-tertiary); }
 `
 
 // ---------- text index: whitespace-collapsed text ↔ DOM positions ----------
 
-function buildIndex(root) {
+/**
+ * The visible text under `roots`, whitespace collapsed, with the DOM position
+ * of each character. `breaks` holds the spaces that stand for a line or block
+ * break, so a quote can keep its paragraphs.
+ */
+function buildIndex(roots) {
   const chars = []
   const posNode = []
   const posOff = []
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode: n =>
-      n.parentElement && !n.parentElement.closest('[data-hm-hidden], style, script')
-        ? NodeFilter.FILTER_ACCEPT
-        : NodeFilter.FILTER_REJECT
-  })
+  const breaks = new Set()
   let prevSpace = true
   let prevNode = null
   let prevBlock = null
 
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const s = node.data
-    const block = node.parentElement.closest(BLOCKS)
+  for (const root of roots) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: n =>
+        n.parentElement && !n.parentElement.closest('style, script') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+    })
 
-    // Adjacent blocks (list items, paragraphs) have no space in the DOM.
-    if (prevNode && block !== prevBlock && !prevSpace) {
-      chars.push(' ')
-      posNode.push(prevNode)
-      posOff.push(prevNode.data.length)
-      prevSpace = true
-    }
-    prevNode = node
-    prevBlock = block
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const s = node.data
+      const block = node.parentElement.closest(BLOCKS)
 
-    for (let i = 0; i < s.length; i++) {
-      const space = /\s/.test(s[i])
+      // Adjacent blocks (list items, paragraphs) have no space in the DOM.
+      if (prevNode && block !== prevBlock && !prevSpace) {
+        breaks.add(chars.length)
+        chars.push(' ')
+        posNode.push(prevNode)
+        posOff.push(prevNode.data.length)
+        prevSpace = true
+      }
+      prevNode = node
+      prevBlock = block
 
-      if (space && prevSpace) continue
-      chars.push(space ? ' ' : s[i])
-      posNode.push(node)
-      posOff.push(i)
-      prevSpace = space
+      for (let i = 0; i < s.length; i++) {
+        const space = /\s/.test(s[i])
+
+        if (space && prevSpace) {
+          if (s[i] === '\n' && chars.length) breaks.add(chars.length - 1)
+          continue
+        }
+        if (s[i] === '\n') breaks.add(chars.length)
+        chars.push(space ? ' ' : s[i])
+        posNode.push(node)
+        posOff.push(i)
+        prevSpace = space
+      }
     }
   }
 
-  return { text: chars.join(''), posNode, posOff }
+  return { text: chars.join(''), posNode, posOff, breaks }
 }
 
 /** First index whose character sits at or after a DOM boundary point. */
@@ -160,7 +170,6 @@ function indexAt(idx, container, offset) {
 
 function rangeFor(idx, start, end) {
   const r = document.createRange()
-
   const last = idx.posNode[end - 1]
 
   r.setStart(idx.posNode[start], idx.posOff[start])
@@ -186,40 +195,92 @@ function sharedPrefix(a, b) {
   return n
 }
 
-/** Where the anchor's text sits in the index; prefix/suffix pick between repeats. */
-function locate(idx, anchor) {
-  if (!anchor?.exact) return null
+/**
+ * The best place for `quote` among `indexes` (in order of preference): the
+ * occurrence whose surroundings match the hint best; without a hint, the
+ * first one in the first index that has it.
+ */
+function findQuote(indexes, quote, hint) {
+  const prefix = hint?.prefix ?? ''
+  const suffix = hint?.suffix ?? ''
+  const perfect = prefix.length + suffix.length
   let best = null
-  let bestScore = -1
 
-  for (let at = idx.text.indexOf(anchor.exact); at >= 0; at = idx.text.indexOf(anchor.exact, at + 1)) {
-    const end = at + anchor.exact.length
-    const score =
-      sharedSuffix(idx.text.slice(Math.max(0, at - CONTEXT_CHARS), at), anchor.prefix) +
-      sharedPrefix(idx.text.slice(end, end + CONTEXT_CHARS), anchor.suffix)
+  for (let i = 0; i < indexes.length; i++) {
+    const { text } = indexes[i]()
 
-    if (score > bestScore) {
-      best = [at, end]
-      bestScore = score
+    for (let at = text.indexOf(quote); at >= 0; at = text.indexOf(quote, at + 1)) {
+      const end = at + quote.length
+      const score =
+        sharedSuffix(text.slice(Math.max(0, at - CONTEXT_CHARS), at), prefix) +
+        sharedPrefix(text.slice(end, end + CONTEXT_CHARS), suffix)
+
+      if (!best || score > best.score) best = { i, at, end, score }
+      if (score === perfect) return best
     }
   }
 
-  return best && rangeFor(idx, best[0], best[1])
+  return best
 }
 
-/** The text at [s, t) with enough context around it to find it again later. */
-function anchorFor(idx, s, t) {
-  return {
-    exact: idx.text.slice(s, t),
-    prefix: idx.text.slice(Math.max(0, s - CONTEXT_CHARS), s),
-    suffix: idx.text.slice(t, t + CONTEXT_CHARS)
-  }
+/** The text at [s, t) with line breaks restored, for the quote the agent reads. */
+function quoteOf(idx, s, t) {
+  let out = ''
+
+  for (let i = s; i < t; i++) out += idx.breaks.has(i) ? '\n' : idx.text[i]
+
+  return out
 }
 
-function rectHit(range, x, y) {
-  for (const r of range.getClientRects()) {
-    if (x >= r.left - 1 && x <= r.right + 1 && y >= r.top - 1 && y <= r.bottom + 1) return true
+const collapse = text => String(text || '').replace(/\s+/g, ' ').trim()
+
+/**
+ * A user bubble's text as it was sent. Hermes draws `code` and ``` fences as
+ * elements without their backticks; put them back, so a quote of code in a
+ * reply still matches the reply.
+ */
+function sentText(node) {
+  if (node.nodeType === Node.TEXT_NODE) return node.data
+  if (node.nodeType !== Node.ELEMENT_NODE) return ''
+  if (node.matches('pre')) return `\`\`\`\n${node.textContent}\`\`\``
+  if (node.matches('code')) {
+    const fence = node.textContent.includes('`') ? '``' : '`'
+
+    return `${fence}${node.textContent}${fence}`
   }
+
+  return [...node.childNodes].map(sentText).join('')
+}
+
+/** "> passage" lines, a blank line, then the prompt; anything else is null. */
+function parseQuoteReply(text) {
+  const lines = String(text || '').trim().split('\n')
+  let n = 0
+
+  while (n < lines.length && lines[n].startsWith('>')) n++
+  if (!n || n >= lines.length || lines[n].trim()) return null
+  const quote = collapse(lines.slice(0, n).map(line => line.replace(/^> ?/, '')).join(' '))
+  const prompt = lines.slice(n).join('\n').trim()
+
+  return quote && prompt ? { quote, prompt } : null
+}
+
+/** One key for a prompt, however its whitespace and code were rendered. */
+const promptKey = (quote, prompt) => [quote, prompt].map(part => collapse(part.replaceAll('`', ''))).join('\n')
+
+function compose(quote, prompt) {
+  return `${quote
+    .split('\n')
+    .map(line => `> ${line.trim()}`)
+    .join('\n')}\n\n${prompt}`
+}
+
+function rectHit(rect, x, y) {
+  return x >= rect.left - 1 && x <= rect.right + 1 && y >= rect.top - 1 && y <= rect.bottom + 1
+}
+
+function rangeHit(range, x, y) {
+  for (const r of range.getClientRects()) if (rectHit(r, x, y)) return true
 
   return false
 }
@@ -234,31 +295,6 @@ function place(pop, rect) {
   if (top + h > window.innerHeight - 8) top = rect.top - h - 6
   pop.style.left = `${left}px`
   pop.style.top = `${Math.max(8, top)}px`
-}
-
-/** First few sentences of an answer, as plain text; its start identifies the reply bubble. */
-function extract(markdownText) {
-  const plain = String(markdownText || '')
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`([^`]*)`/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/^\s{0,3}(#{1,6}|[-*+]|\d+[.)])\s+/gm, '')
-    .replace(/[*_~]{1,3}([^*_~]+)[*_~]{1,3}/g, '$1')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  if (plain.length <= 320) return plain
-  const cut = plain.slice(0, 320)
-  const stop = cut.lastIndexOf('. ')
-
-  return stop > 160 ? cut.slice(0, stop + 1) : `${cut.trimEnd()}…`
-}
-
-/** Letters and digits only (any script), so rendered Markdown and its source compare equal. */
-function textKey(text) {
-  return String(text || '')
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
 /** Letters and digits; `.`/`,` inside a number and `'` inside a word too. */
@@ -293,67 +329,61 @@ function snapSpan(text, s, t) {
   return [s, t]
 }
 
-/** Roots on screen: the app keeps chats you switched away from mounted in
+/** Elements on screen: the app keeps chats you switched away from mounted in
  *  hidden panes, and a link must never land in one of those. */
-const shownRoots = selector =>
-  [...document.querySelectorAll(selector)].filter(el => !el.closest('[inert], [aria-hidden="true"], [data-pane-hidden]'))
+const shown = el => !el.closest('[inert], [aria-hidden="true"], [data-pane-hidden]')
+
+/** A reply's own text: its Markdown blocks, not its thinking or tool rows. */
+const answerBlocks = group =>
+  [...group.querySelectorAll('.aui-md')].filter(
+    el => !el.closest(USER_ROOT) && !el.closest(THINKING) && !el.parentElement?.closest('.aui-md')
+  )
 
 // ---------- the plugin ----------
 
 export default {
   id: 'inline',
   name: 'Inline',
-  description: 'Select text in a reply, right-click and ask about it: the answer becomes a link on the passage.',
+  description: 'Select text in a reply, right-click and write a prompt: the answer opens at the passage.',
 
   register(ctx) {
     const state = host.state
-    let notes = ctx.storage.get('notes', [])
-    // One link turn runs at a time, and only while its chat is idle: sent
-    // mid-turn, Hermes would queue it and could merge it with a message the
-    // user queued.
-    const queue = [] // { note, turn, sid }
-    let active = null // { note, turn, sid, responded, admission, userRow, starts, started, root, before, last }
-    const busy = sid => Boolean(state.busyBySession.get()[sid])
-    const $render = atom([]) // note ids the hidden renderer should draw
-    const htmlCache = new Map() // note id -> { answer, html }
-    let anchored = [] // { note, range }
-    let ask = null // { pop, range }
+    // Marks the turns this copy hid, so a copy being replaced (hot reload)
+    // never un-hides the turns the new copy just hid.
+    const instance = Math.random().toString(36).slice(2, 8)
+    let hints = ctx.storage.get('hints', {}) // prompt key -> { prefix, suffix, at }
+    let lastFocus = { stored: null, runtime: null }
+    const busy = sid => Boolean(sid && state.busyBySession.get()[sid])
+
+    // What the chat holds, read again from the page on every scan.
+    let links = [] // { id, key, text, quote, prompt, group, shown, source, span, answer, userId, status, error, stopped }
+    let linksById = new Map()
+    let promptCounts = new Map() // prompt key -> quote-replies with it in the chats, links or not
+    const replyCache = new WeakMap() // message group -> { group, blocks, index(), link }, until the group changes
+    const statusSeen = new Map() // link id -> status at the last scan (for the ready glow)
+    // Prompts on their way into the chat: waiting for it to go idle, or sent and not shown yet.
+    const asks = [] // { text, key, range, sid, stored, sent, held, before, cancel }
+    let anchored = [] // { link | ask, range }
+    let ask = null // the ask box: { pop, range }
     let hovered = null
     // Cards open at their links, deepest last: cards[d] answers a link that
     // sits in the chat (d = 0) or in cards[d - 1].
-    const cards = [] // { note, range, pop, body, actions, pinned }
-    let lastFocus = { stored: null, runtime: null }
-    let threadCache = new WeakMap() // thread root -> text index, until the DOM changes
-
-    // Questions asked before a restart will never be answered.
-    for (const note of notes) {
-      note.parentId ??= null
-      for (const turn of note.turns) {
-        if (turn.status === 'pending') {
-          Object.assign(turn, { status: 'error', answer: 'No answer arrived (the app restarted while waiting).' })
-        }
-      }
-    }
-
-    const byId = id => notes.find(n => n.id === id)
-    const rootOf = note => (note.parentId ? rootOf(byId(note.parentId) ?? { ...note, parentId: null }) : note)
-    const save = () => ctx.storage.set('notes', notes)
+    const cards = [] // { link, range, pop, body, actions, pinned, page, idx, sig }
 
     const style = document.createElement('style')
+    const ticks = document.createElement('style')
     const layer = document.createElement('div')
 
     style.textContent = CSS_TEXT
     layer.className = 'hm-layer'
-    document.head.append(style)
+    document.head.append(style, ticks)
     document.body.append(layer)
 
-    const HL = ['hm-link', 'hm-current', 'hm-pending', 'hm-hover', 'hm-draft', 'hm-ready']
+    const HL = ['hm-link', 'hm-wait', 'hm-open', 'hm-hover', 'hm-draft', 'hm-ready']
     const hl = Object.fromEntries(HL.map(name => [name, new Highlight()]))
 
     hl['hm-hover'].priority = 1
     for (const name of HL) CSS.highlights.set(name, hl[name])
-
-    // ----- which chat is on screen -----
 
     function trackFocus() {
       const stored = state.focusedStoredSessionId.get()
@@ -364,134 +394,202 @@ export default {
 
     trackFocus()
 
-    function inChat(note) {
-      if (note.parentId) return false
-      if (note.storedSessionId) return note.storedSessionId === lastFocus.stored
-      if (note.sessionId === lastFocus.runtime && lastFocus.stored) note.storedSessionId = lastFocus.stored
+    // ----- reading the chat -----
 
-      return note.sessionId === lastFocus.runtime
+    function replyOf(group) {
+      let reply = replyCache.get(group)
+
+      if (!reply) {
+        const blocks = answerBlocks(group)
+        let idx = null
+
+        reply = { group, blocks, index: () => (idx ??= buildIndex(blocks)), link: null }
+        replyCache.set(group, reply)
+      }
+
+      return reply
     }
 
-    /** Live runtime session to ask through: the chat a note's tree hangs off. */
-    function sessionFor(note) {
-      const root = rootOf(note)
+    /** Where a link's answer stands: 'wait', 'done' or 'error', read from its turn. */
+    function stateOf(group, answer, last, rootBusy) {
+      const text = answer.blocks.some(b => b.textContent.trim())
+      const streaming = Boolean(group.querySelector(STREAMING))
+      const error = group.querySelector(ALERT)?.textContent.trim() ?? ''
+      const stopped = Boolean(group.querySelector(STOPPED))
+      let status = 'error'
 
-      return root.storedSessionId && root.storedSessionId === lastFocus.stored ? lastFocus.runtime : root.sessionId
-    }
+      if (text && !streaming) status = 'done'
+      else if (streaming) status = 'wait'
+      // Sent, and the agent hasn't started a reply yet.
+      else if (!error && !stopped && last && rootBusy && !group.querySelector(ASSISTANT)) status = 'wait'
 
-    // ----- painting links + hiding the reply bubbles of our turns -----
-
-    /** The thread on screen for a runtime session: only when it is the one chat shown. */
-    function threadFor(sid) {
-      if (sid !== lastFocus.runtime) return null
-      const roots = shownRoots(THREAD)
-
-      return roots.length === 1 ? roots[0] : null
-    }
-
-    function hideBubble(el) {
-      el.dataset.hmHidden = ''
-      el.style.display = 'none'
+      return { status, error, stopped }
     }
 
     /**
-     * While our turn streams, every assistant bubble that appears in its
-     * thread after the last one present at its start is ours. Once answered
-     * (and after a reload) a bubble is ours when its text contains the start
-     * of one of this chat's answers.
+     * Find every link in every mounted chat and hide its turn. A turn is a
+     * link when its message is a quote-reply whose passage sits in an earlier
+     * reply (an answer shown in a card counts: that makes a nested link).
      */
-    function hideLiveReply() {
-      const run = active?.started && active.root?.isConnected ? active : null
+    function scan() {
+      const found = []
+      const counts = new Map()
+      const roots = [...document.querySelectorAll(THREAD)]
+      const onScreen = roots.filter(shown)
 
-      if (!run || run.root !== threadFor(run.sid) || (run.last && !run.last.isConnected)) return
-      for (const el of run.root.querySelectorAll('[data-role="assistant"]:not([data-hm-hidden])')) {
-        if (!run.before.has(el) && (!run.last || run.last.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) {
-          hideBubble(el)
+      for (const root of roots) {
+        const groups = root.querySelectorAll(GROUP)
+        // Replies above this turn, nearest first: the chat's own replies are
+        // searched before link answers, which tend to repeat what they're about.
+        const replies = []
+        const answers = []
+        const seen = new Map() // prompt key -> times in this chat
+        // Only a lone chat on screen is known to be the focused session.
+        const rootBusy = onScreen.length === 1 && onScreen[0] === root ? busy(lastFocus.runtime) : true
+
+        groups.forEach((group, i) => {
+          const bubble = group.querySelector(USER_TEXT)
+          const text = bubble ? sentText(bubble).trim() : ''
+          const parsed = text ? parseQuoteReply(text) : null
+          const reply = replyOf(group)
+          let link = null
+
+          if (parsed) {
+            const key = promptKey(parsed.quote, parsed.prompt)
+            const n = (seen.get(key) ?? 0) + 1
+            const earlier = [...replies, ...answers]
+            const hit = findQuote(
+              earlier.map(r => r.index),
+              parsed.quote,
+              hints[key]
+            )
+
+            seen.set(key, n)
+            counts.set(key, (counts.get(key) ?? 0) + 1)
+            if (hit) {
+              link = {
+                id: `${n}:${key}`,
+                key,
+                text,
+                quote: parsed.quote,
+                prompt: parsed.prompt,
+                group,
+                shown: onScreen.includes(root),
+                source: earlier[hit.i],
+                span: [hit.at, hit.end],
+                answer: reply,
+                userId: group.querySelector(USER_ROOT)?.dataset.messageId ?? null,
+                ...stateOf(group, reply, i === groups.length - 1, rootBusy)
+              }
+              found.push(link)
+            }
+          }
+          if (link) {
+            if (group.getAttribute(TURN_ATTR) !== instance) group.setAttribute(TURN_ATTR, instance)
+          } else if (group.hasAttribute(TURN_ATTR)) group.removeAttribute(TURN_ATTR)
+          reply.link = link
+          if (reply.blocks.length) (link ? answers : replies).unshift(reply)
+        })
+      }
+
+      links = found
+      linksById = new Map(found.map(link => [link.id, link]))
+      promptCounts = counts
+
+      // A prompt that reached the chat is a link now (or, if its passage
+      // can't be found, an ordinary message).
+      let arrived = false
+
+      for (const a of [...asks]) {
+        if (a.sent && (counts.get(a.key) ?? 0) > a.before) {
+          asks.splice(asks.indexOf(a), 1)
+          a.cancel?.()
+          arrived = true
         }
       }
-    }
+      if (arrived) pumpSoon()
 
-    function hideOwnReplies() {
-      hideLiveReply()
-      const keys = []
-
-      for (const note of notes) {
-        if (!inChat(rootOf(note))) continue
-        for (const turn of note.turns) if (turn.status === 'done' && turn.key?.length >= 20) keys.push(turn.key)
-      }
-      if (!keys.length) return
-      for (const root of shownRoots(THREAD)) {
-        for (const el of root.querySelectorAll('[data-role="assistant"]:not([data-hm-hidden])')) {
-          const text = textKey(el.textContent)
-
-          if (keys.some(key => text.includes(key))) hideBubble(el)
-        }
-      }
-    }
-
-    function threadIndex(root) {
-      let idx = threadCache.get(root)
-
-      if (!idx) {
-        idx = buildIndex(root)
-        threadCache.set(root, idx)
+      for (const link of found) {
+        if (statusSeen.get(link.id) === 'wait' && link.status === 'done') glow(link.id)
+        statusSeen.set(link.id, link.status)
       }
 
-      return idx
+      // The timeline's tick for each hidden turn goes too.
+      const tickIds = found.filter(l => l.userId).map(l => `[data-timeline-id="${CSS.escape(l.userId)}"]`)
+      const tickCss = tickIds.length ? `${tickIds.join(',\n')} { visibility: hidden; pointer-events: none; }` : ''
+
+      if (ticks.textContent !== tickCss) ticks.textContent = tickCss
     }
+
+    // ----- painting -----
 
     function paint() {
-      hideOwnReplies()
-      threadCache = new WeakMap()
+      scan()
+      // Cards follow their links: refreshed while an answer streams, closed
+      // when the link is gone (its turn was removed by a restore or an edit).
+      for (let i = 0; i < cards.length; i++) {
+        const link = linksById.get(cards[i].link.id)
+
+        if (!link) {
+          dropCards(i)
+          break
+        }
+        cards[i].link = link
+        if (signature(link) !== cards[i].sig) fillCard(cards[i])
+      }
+
       anchored = []
-      const chatNotes = notes.filter(inChat)
+      // Of links on the same passage, the latest wins.
+      const taken = new Map()
+      const claim = (source, span) => {
+        const spans = taken.get(source) ?? new Set()
 
-      if (chatNotes.length) {
-        for (const root of shownRoots(THREAD)) {
-          const idx = threadIndex(root)
+        taken.set(source, spans)
+        if (spans.has(`${span}`)) return false
+        spans.add(`${span}`)
 
-          for (const note of chatNotes) {
-            if (anchored.some(a => a.note === note)) continue
-            const range = locate(idx, note.anchor)
+        return true
+      }
+      const newestFirst = [...links].reverse()
 
-            if (range) anchored.push({ note, range })
-          }
+      for (const link of newestFirst) {
+        if (!link.shown || link.source.link || !claim(link.source, link.span)) continue
+        anchored.push({ link, range: rangeFor(link.source.index(), ...link.span) })
+      }
+      // A passage in an answer is drawn in that answer's card, when it is open.
+      for (const card of cards) {
+        if (!card.page) continue
+        const idx = (card.idx ??= buildIndex([card.page]))
+
+        for (const link of newestFirst) {
+          if (link.source.group !== card.link.group || !claim(link.source, link.span)) continue
+          const [s, t] = link.span
+
+          if (idx.text.slice(s, t) === link.quote) anchored.push({ link, range: rangeFor(idx, s, t) })
         }
       }
-      // Each answer on screen (in a card) is its own root; a child link lives in one.
-      for (const root of shownRoots(`[${PAGE_ATTR}]`)) {
-        const children = notes.filter(n => n.parentId === root.getAttribute(PAGE_ATTR))
+      for (const a of asks) if (a.range?.toString()) anchored.push({ ask: a, range: a.range })
 
-        if (!children.length) continue
-        const idx = buildIndex(root)
+      for (const name of ['hm-link', 'hm-wait', 'hm-open', 'hm-ready']) hl[name].clear()
+      const open = new Set(cards.map(c => c.link.id))
 
-        for (const note of children) {
-          const range = locate(idx, note.anchor)
-
-          if (range) anchored.push({ note, range })
-        }
+      for (const a of anchored) {
+        if (a.ask) hl['hm-wait'].add(a.range)
+        else hl[open.has(a.link.id) ? 'hm-open' : a.link.status === 'done' ? 'hm-link' : 'hm-wait'].add(a.range)
+        if (a.link && readyIds.has(a.link.id)) hl['hm-ready'].add(a.range)
       }
-      for (const name of ['hm-link', 'hm-current', 'hm-pending']) hl[name].clear()
-      const open = new Set(cards.map(c => c.note))
-
-      for (const { note, range } of anchored) {
-        const pending = note.turns[0]?.status !== 'done'
-
-        hl[pending ? 'hm-pending' : open.has(note) ? 'hm-current' : 'hm-link'].add(range)
-      }
-      hl['hm-ready'].clear()
-      for (const { note, range } of anchored) if (readyIds.has(note.id)) hl['hm-ready'].add(range)
-      hovered = (hovered && anchored.find(a => a.note === hovered.note)) || null
+      for (const card of cards) card.range = anchored.find(a => a.link?.id === card.link.id)?.range ?? card.range
+      hovered = (hovered && anchored.find(a => a.link && a.link.id === hovered.link.id)) || null
       setHover(hovered)
+      if (asks.some(a => !a.sent)) pumpSoon()
     }
 
     // The "it's ready" glow: in quickly, out slowly, once.
     const readyIds = new Set()
     let readyFrame = 0
 
-    function flashReady(id) {
+    function glow(id) {
       readyIds.add(id)
-      paint()
       const start = performance.now()
 
       cancelAnimationFrame(readyFrame)
@@ -511,11 +609,6 @@ export default {
       readyFrame = requestAnimationFrame(step)
     }
 
-    ctx.onDispose(() => {
-      cancelAnimationFrame(readyFrame)
-      document.documentElement.style.removeProperty('--hm-ready-a')
-    })
-
     let paintTimer = null
     const schedulePaint = () => {
       if (paintTimer) return
@@ -525,227 +618,130 @@ export default {
       }, 150)
     }
 
+    /** A record that adds a turn (or a user bubble) to a chat. */
+    const addsTurn = record =>
+      [...record.addedNodes].some(
+        n => n.nodeType === Node.ELEMENT_NODE && (n.matches(`${GROUP}, ${USER_TEXT}`) || n.querySelector(`${GROUP}, ${USER_TEXT}`))
+      )
+
     const observer = new MutationObserver(records => {
       if (records.every(r => layer.contains(r.target))) return
-      // Before the frame is drawn, so our reply never shows in the chat.
-      if (active?.started) hideLiveReply()
-      threadCache = new WeakMap()
+      for (const r of records) {
+        const el = r.target.nodeType === Node.ELEMENT_NODE ? r.target : r.target.parentElement
+        const group = el?.closest(GROUP)
+
+        if (group) replyCache.delete(group)
+      }
+      // Before the frame is drawn, so a new link turn never shows in the chat.
+      if (records.some(addsTurn)) scan()
       schedulePaint()
     })
 
     observer.observe(document.body, { childList: true, subtree: true, characterData: true })
 
-    // ----- asking -----
+    // ----- sending prompts -----
 
-    // What the model reads: an ordinary quote-reply. The user never sees it
-    // (the row is hidden).
-    function compose(note, turn) {
-      return `${note.quote.replace(/^/gm, '> ')}\n\n${turn.question}`
+    function rememberHint(key, hint) {
+      hints = { ...ctx.storage.get('hints', {}), [key]: { ...hint, at: Date.now() } }
+      const keys = Object.keys(hints)
+
+      if (keys.length > MAX_HINTS) {
+        keys.sort((a, b) => hints[a].at - hints[b].at)
+        for (const k of keys.slice(0, keys.length - MAX_HINTS)) delete hints[k]
+      }
+      ctx.storage.set('hints', hints)
     }
 
-    function settle(turn, fields) {
-      Object.assign(turn, fields)
-      save()
+    function queueAsk(text, key, range) {
+      if (!lastFocus.runtime) {
+        host.notify({ kind: 'error', message: 'No live session for this chat.' })
+
+        return
+      }
+      asks.push({ text, key, range, sid: lastFocus.runtime, stored: lastFocus.stored, sent: false })
       paint()
-      for (const card of cards) if (card.note.turns.includes(turn)) fillCard(card)
+      pump()
     }
 
-    function finish(run, payload) {
-      const answer = String(payload?.text || payload?.rendered || '').trim()
-      const status = payload?.status
+    function dropAsk(a, message) {
+      const i = asks.indexOf(a)
 
-      // A provider error or a press of Stop: no answer, so no link; Retry asks again.
-      if (status && status !== 'complete') {
-        settle(run.turn, { status: 'error', answer: status === 'interrupted' ? 'Stopped before it finished.' : answer || `The agent stopped (${status}).` })
-
-        return
-      }
-      if (!answer) {
-        settle(run.turn, { status: 'error', answer: 'The agent returned no text.' })
-
-        return
-      }
-      requestRender(run.note, answer)
-      settle(run.turn, { status: 'done', answer, key: textKey(extract(answer)).slice(0, 60) })
-      flashReady(run.note.id)
+      if (i < 0) return
+      asks.splice(i, 1)
+      a.cancel?.()
+      if (message) host.notify({ kind: 'error', message })
+      paint()
     }
 
-    function release(run) {
-      if (active !== run) return
-      active = null
-      void pump()
-    }
+    /** The chat surface (a chat and its message box) a prompt goes through: its tile, else the main one. */
+    const surfaceOf = a =>
+      (a.stored && document.querySelector(`${SURFACE_ROOT}[data-session-anchor="session-tile:${CSS.escape(a.stored)}"]`)) ||
+      document.querySelector(`${SURFACE_ROOT}[data-composer-target="main"]`)
 
-    async function pump() {
-      if (active) return
-      const next = queue.findIndex(q => !busy(q.sid))
-
-      if (next < 0) return
-      const run = { ...queue.splice(next, 1)[0], responded: false, admission: null, userRow: null, starts: [], started: false }
-
-      active = run
-      ctx.setTimeout(() => {
-        if (active !== run) return
-        settle(run.turn, { status: 'error', answer: 'No answer after 10 minutes.' })
-        release(run)
-      }, TURN_TIMEOUT_MS)
-      try {
-        const res = await host.request('prompt.submit', {
-          session_id: run.sid,
-          text: compose(run.note, run.turn),
-          display_kind: 'hidden',
-          // If a turn started meanwhile, wait behind it rather than steer it.
-          queued: true
-        })
-
-        if (active !== run) return
-        // How we know our turn: a gateway that owns the chat answers with an
-        // admission id its stream events repeat; an idle chat starts the turn
-        // at once ('streaming') and names its stored question row.
-        Object.assign(run, {
-          responded: true,
-          admission: res?.admission_id || null,
-          userRow: typeof res?.user_row_id === 'number' ? res.user_row_id : null
-        })
-        if (!run.admission && res?.status !== 'streaming') {
-          // Queued with nothing to follow it by: never guess which reply is ours.
-          settle(run.turn, { status: 'error', answer: 'Hermes was busy, so the question waited in its queue; its answer shows in the chat.' })
-          release(run)
-
-          return
+    /**
+     * Send the next prompt through its chat's own message box, exactly as if
+     * it were typed. Only while the chat is idle: sent mid-turn, Hermes would
+     * fold it into the running turn instead of giving it a turn of its own.
+     */
+    function pump() {
+      if (asks.some(a => a.sent)) return
+      for (const next of [...asks]) {
+        if (busy(next.sid)) continue
+        // Hermes sends whatever is attached in the message box along with a
+        // message, so a prompt waits until the box has no attachments.
+        if (surfaceOf(next)?.querySelector(ATTACHMENTS)) {
+          if (!next.held) host.notify({ kind: 'info', message: 'Your Inline prompt goes once the attachment in the message box is sent or removed.' })
+          next.held = true
+          continue
         }
-        const seen = run.admission ? run.starts.find(start => start.id === run.admission) : run.starts.at(-1)
+        const before = promptCounts.get(next.key) ?? 0
 
-        if (seen) adopt(run, seen)
-      } catch (err) {
-        if (active !== run) return
-        settle(run.turn, { status: 'error', answer: String(err?.message || err) })
-        release(run)
-      }
-    }
-
-    const adopt = (run, start) => Object.assign(run, { started: true, root: start.root, before: start.before, last: start.last })
-
-    // A chat going idle is the moment to ask its waiting questions.
-    ctx.onDispose(state.busyBySession.listen(() => void pump()))
-
-    function send(note, turn) {
-      const sid = sessionFor(note)
-
-      if (!sid) {
-        settle(turn, { status: 'error', answer: 'Open the chat this came from to ask.' })
+        if (!host.composer?.submit(next.sid, next.text)) {
+          // Its chat isn't on screen: it goes when the chat is back.
+          if (next.sid === lastFocus.runtime) dropAsk(next, "Inline couldn't reach this chat's message box.")
+          continue
+        }
+        Object.assign(next, { sent: true, before })
+        next.cancel = ctx.setTimeout(() => {
+          dropAsk(next, "Hermes didn't take the prompt.")
+          pump()
+        }, SEND_TIMEOUT_MS)
 
         return
       }
-      settle(turn, { status: 'pending', at: Date.now(), answer: undefined, key: undefined })
-      queue.push({ note, turn, sid })
-      void pump()
     }
 
-    const admissionOf = event => event?.admission_id ?? event?.payload?.admission_id ?? null
+    // After the app has re-rendered for the change that called it (a chat
+    // going idle, another chat coming into view): the message box acts on
+    // its last render, and before that it would still see the old state.
+    let pumpFrame = 0
 
-    ctx.onEvent('message.start', event => {
-      const run = active
-
-      if (!run || run.sid !== event?.session_id || run.started) return
-      // Bubbles present when the turn starts are not ours; only in its own
-      // thread, and only when that chat is on screen.
-      const root = threadFor(run.sid)
-      const before = root ? [...root.querySelectorAll('[data-role="assistant"]')] : []
-      const start = { id: admissionOf(event), root, before: new Set(before), last: before.at(-1) ?? null }
-
-      // Before the submit reply we can't tell whose turn this is yet.
-      if (!run.responded) run.starts.push(start)
-      else if (run.admission ? start.id === run.admission : true) adopt(run, start)
-    })
-
-    ctx.onEvent('message.complete', event => {
-      const run = active
-
-      if (!run?.responded || run.sid !== event?.session_id) return
-      const row = event.payload?.persisted_turn?.user_row_id
-      const ours = run.admission
-        ? admissionOf(event) === run.admission
-        : run.started && (run.userRow === null || typeof row !== 'number' || row === run.userRow)
-
-      if (!ours) return
-      // Hide the finished bubble before clearing `active`, which tracks it.
-      hideOwnReplies()
-      finish(run, event.payload)
-      release(run)
-    })
-
-    // ----- rendering answers -----
-
-    // The answer is drawn by the app's own Markdown renderer, out of sight in
-    // a composer slot, and its HTML copied into the card: same typography as
-    // a chat message, without a React root of our own.
-    function Renderer() {
-      const ids = useValue($render)
-
-      useEffect(() => {
-        if (!ids.length) return
-        const harvest = () => {
-          for (const id of ids) {
-            const el = document.querySelector(`[data-hm-src="${id}"]`)
-            const answer = byId(id)?.turns[0]?.answer
-
-            if (!el || !answer || !el.childElementCount) continue
-            htmlCache.set(id, { answer, html: el.innerHTML })
-            // The rendered text is what the reply bubble shows (code included):
-            // the surest key for finding that bubble again after a reload.
-            const turn = byId(id).turns[0]
-            const key = textKey(el.textContent).slice(0, 60)
-
-            if (turn.status === 'done' && key.length >= 20 && turn.key !== key) {
-              turn.key = key
-              save()
-            }
-            for (const card of cards) if (card.note.id === id) fillCard(card)
-          }
-        }
-
-        harvest()
-        // Highlighted code arrives a moment later; take it too, then let go.
-        // (ctx.setTimeout returns its own cancel function: the effect's cleanup.)
-        return ctx.setTimeout(() => {
-          harvest()
-          $render.set($render.get().filter(id => !ids.includes(id)))
-        }, 400)
-      }, [ids])
-
-      return jsx('div', {
-        className: 'hm-src',
-        'aria-hidden': 'true',
-        children: ids.map(id => {
-          const answer = byId(id)?.turns[0]?.answer
-
-          return answer
-            ? jsx(
-                'div',
-                {
-                  className: ANSWER_CLASS,
-                  'data-hm-src': id,
-                  children: jsx(Streamdown, { controls: false, mode: 'static', parseIncompleteMarkdown: false, children: answer })
-                },
-                id
-              )
-            : null
-        })
+    function pumpSoon() {
+      cancelAnimationFrame(pumpFrame)
+      pumpFrame = requestAnimationFrame(() => {
+        pumpFrame = 0
+        pump()
       })
     }
 
-    ctx.register({ id: 'renderer', area: COMPOSER_AREAS.underside, render: () => jsx(Renderer, {}) })
+    // A chat going idle is the moment to send its waiting prompt; it also
+    // settles links (no reply came = no answer).
+    ctx.onDispose(
+      state.busyBySession.listen(() => {
+        pumpSoon()
+        schedulePaint()
+      })
+    )
 
-    function cachedHtml(note) {
-      const hit = htmlCache.get(note.id)
+    /** The message for a prompt, and its hint for telling repeats of the passage apart. */
+    function prepare(quote, prompt, hint) {
+      const text = compose(quote, prompt)
+      const parsed = parseQuoteReply(text)
+      const key = promptKey(parsed.quote, parsed.prompt)
 
-      return hit && hit.answer === note.turns[0]?.answer ? hit.html : null
-    }
+      rememberHint(key, hint)
 
-    function requestRender(note, answer = note.turns[0]?.answer) {
-      if (!answer || cachedHtml(note) !== null || $render.get().includes(note.id)) return
-      $render.set([...$render.get(), note.id])
+      return { text, key }
     }
 
     // ----- cards: the answer, at its link -----
@@ -771,58 +767,60 @@ export default {
       return button
     }
 
+    const signature = link =>
+      `${link.status}|${link.error}|${link.stopped}|${link.answer.blocks.map(b => b.textContent.length).join(',')}`
+
+    /** The card shows the reply Hermes already drew: a copy of its Markdown. */
     function fillCard(card) {
-      const { note, body, actions } = card
-      const turn = note.turns[0]
+      const { link, body, actions } = card
+      const blocks = link.answer.blocks.filter(b => b.textContent.trim())
 
       body.replaceChildren()
       actions.replaceChildren()
-      if (!turn || turn.status === 'pending') {
-        body.append(element('div', 'hm-card-wait'))
-      } else if (turn.status === 'error') {
-        body.append(element('div', 'hm-card-error', `No answer: ${turn.answer}`))
-        actions.append(action('Retry', () => send(note, turn)))
-      } else {
-        const content = element('div', ANSWER_CLASS)
-        const html = cachedHtml(note)
+      Object.assign(card, { page: null, idx: null, sig: signature(link) })
+      if (blocks.length) {
+        const page = element('div', '')
 
-        content.setAttribute(PAGE_ATTR, note.id)
-        content.dataset.selectableText = 'true'
-        if (html !== null) content.innerHTML = html
-        else {
-          // Plain text until the rendered version is ready (a frame or two).
-          content.classList.add('hm-plain')
-          content.textContent = turn.answer
-          requestRender(note)
-        }
-        body.append(content)
+        page.setAttribute(PAGE_ATTR, '')
+        page.dataset.selectableText = 'true'
+        for (const block of blocks) page.append(block.cloneNode(true))
+        body.append(page)
+        card.page = page
       }
-      if (card.pop.isConnected) {
-        place(card.pop, card.range.getBoundingClientRect())
-        paint()
-      }
+      if (link.status === 'wait') body.append(element('div', 'hm-card-wait'))
+      else if (link.status === 'error') {
+        body.append(element('div', 'hm-card-note', link.error ? `No answer: ${link.error}` : 'No answer arrived.'))
+        actions.append(action('Retry', () => queueAsk(link.text, link.key, null)))
+      } else if (link.error) body.append(element('div', 'hm-card-note', link.error))
+      else if (link.stopped) body.append(element('div', 'hm-card-note', 'Stopped before it finished.'))
+      if (card.pop.isConnected) place(card.pop, card.range.getBoundingClientRect())
+    }
+
+    function dropCards(from = 0) {
+      for (const card of cards.splice(from)) card.pop.remove()
     }
 
     function closeCards(from = 0) {
       if (cards.length <= from) return
-      for (const card of cards.splice(from)) card.pop.remove()
+      dropCards(from)
       paint()
     }
 
     function openCard(depth, hit) {
-      closeCards(depth)
+      dropCards(depth)
       const pop = element('div', `hm-pop hm-card ${SURFACE}`)
-      const body = element('div', 'hm-card-body')
+      // Hermes's own edge fade (the utility behind FadeScroll): a clipped edge
+      // fades out while there is more to scroll, and a short answer shows none.
+      const body = element('div', 'hm-card-body scroll-fade-y')
       const actions = element('div', 'hm-card-actions')
-      const card = { note: hit.note, range: hit.range, pop, body, actions, pinned: false }
+      const card = { link: hit.link, range: hit.range, pop, body, actions, pinned: false, page: null, idx: null, sig: '' }
 
-      // The answer is the card; the question is the angle it was seen from,
+      // The answer is the card; the prompt is the angle it was seen from,
       // so it sits above it as a quiet label rather than a heading.
       const question = element('div', 'hm-card-question')
-      const questionText = element('span', 'hm-card-question-text', hit.note.turns[0]?.question ?? '')
 
-      question.title = hit.note.turns[0]?.question ?? ''
-      question.append(element('span', 'codicon codicon-comment'), questionText)
+      question.title = hit.link.prompt
+      question.append(element('span', 'codicon codicon-comment'), element('span', 'hm-card-question-text', hit.link.prompt))
       pop.append(question, body, actions)
       cards.push(card)
       layer.append(pop)
@@ -868,10 +866,9 @@ export default {
     }
 
     function scheduleOpen(depth, hit) {
-      if (openFor === hit.note) return
+      if (openFor === hit.link.id) return
       cancelOpen()
-      if (hit.note.turns[0]?.status === 'done') requestRender(hit.note)
-      openFor = hit.note
+      openFor = hit.link.id
       // Quicker once a card is up: moving between links is browsing.
       openTimer = setTimeout(
         () => {
@@ -905,7 +902,7 @@ export default {
 
       // Nested links: the innermost (shortest) one wins.
       for (const a of anchored) {
-        if (rectHit(a.range, x, y) && (!best || a.range.toString().length < best.range.toString().length)) best = a
+        if (a.link && rangeHit(a.range, x, y) && (!best || a.range.toString().length < best.range.toString().length)) best = a
       }
 
       return best
@@ -923,14 +920,14 @@ export default {
       const inCard = cards.findLastIndex(c => c.pop.contains(target))
       let keep = inCard + 1
 
-      if (hit?.note !== hovered?.note) {
+      if (hit?.link.id !== hovered?.link.id) {
         hovered = hit
         setHover(hit)
       }
       if (hit) {
         const depth = depthOf(hit)
 
-        if (cards[depth]?.note === hit.note) keep = Math.max(keep, depth + 1)
+        if (cards[depth]?.link.id === hit.link.id) keep = Math.max(keep, depth + 1)
         else {
           keep = Math.max(keep, depth)
           scheduleOpen(depth, hit)
@@ -959,7 +956,7 @@ export default {
       e => {
         if (ask?.pop.contains(e.target)) return
         closeAsk()
-        // A press on a link is a click on it; the click handler decides.
+        // A press on a link leaves its card as it is.
         if (e.button === 0 && hitAt(e.clientX, e.clientY)) return
         const inCard = cards.findLastIndex(c => c.pop.contains(e.target))
 
@@ -972,31 +969,6 @@ export default {
         }
         cancelOpen()
         closeCards(0)
-      },
-      true
-    )
-
-    // Clicking a link opens its card at once and keeps it open.
-    ctx.addEventListener(
-      document,
-      'click',
-      e => {
-        if (e.button !== 0 || e.target.closest?.('.hm-card-action')) return
-        const sel = window.getSelection()
-
-        if (sel && !sel.isCollapsed) return
-        const hit = hitAt(e.clientX, e.clientY)
-
-        if (!hit) return
-        e.preventDefault()
-        e.stopPropagation()
-        cancelOpen()
-        cancelClose()
-        const depth = depthOf(hit)
-        const card = cards[depth]?.note === hit.note ? cards[depth] : openCard(depth, hit)
-
-        for (const c of cards.slice(0, depth + 1)) c.pinned = true
-        card.pinned = true
       },
       true
     )
@@ -1025,17 +997,14 @@ export default {
       ask = null
     }
 
-    function openAsk({ anchor, quote, range, parentId }) {
+    function openAsk({ quote, range, hint }) {
       closeAsk()
       cancelOpen()
       cancelClose()
       const pop = element('div', `hm-pop hm-ask ${SURFACE}`)
       const field = element('div', 'hm-ask-field')
-      const hint = element('div', 'hm-ask-hint', '↵ send  ·  ⇧↵ new line  ·  esc')
 
       field.contentEditable = 'plaintext-only'
-      // Rotating, like the app's own composer hints ("Push it further").
-      field.dataset.placeholder = ASK_HINTS[Math.floor(Math.random() * ASK_HINTS.length)]
       field.addEventListener('keydown', e => {
         e.stopPropagation()
         if (e.key === 'Escape') {
@@ -1043,36 +1012,17 @@ export default {
           closeAsk()
         } else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
           e.preventDefault()
-          const question = field.innerText.trim()
+          const prompt = field.innerText.trim()
 
-          if (!question) return
-          const parent = parentId && byId(parentId)
+          if (!prompt) return
+          const { text, key } = prepare(quote, prompt, hint)
 
-          if (!parent && !lastFocus.runtime) {
-            host.notify({ kind: 'error', message: 'No live session for this chat.' })
-
-            return
-          }
-          const note = {
-            id: Math.random().toString(36).slice(2, 10),
-            parentId: parent ? parent.id : null,
-            sessionId: parent ? null : lastFocus.runtime,
-            storedSessionId: parent ? null : lastFocus.stored,
-            anchor,
-            quote,
-            createdAt: Date.now(),
-            turns: []
-          }
-          const turn = { question }
-
-          notes.push(note)
-          note.turns.push(turn)
           closeAsk()
           window.getSelection()?.removeAllRanges()
-          send(note, turn)
+          queueAsk(text, key, range)
         }
       })
-      pop.append(field, hint)
+      pop.append(element('span', 'codicon codicon-comment'), field)
       layer.append(pop)
       hl['hm-draft'].add(range)
       ask = { pop, range }
@@ -1080,19 +1030,32 @@ export default {
       field.focus()
     }
 
-    /** The selection under (x, y) inside the transcript or a card, if any. */
+    /** Where selectable reply text lives: a reply in a chat, or an answer in a card. */
+    function textRoot(node) {
+      const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement
+
+      if (!el || el.closest('[contenteditable], textarea, input')) return null
+      const page = el.closest(`[${PAGE_ATTR}]`)
+
+      if (page) return { scope: page, index: () => buildIndex([page]) }
+      const group = el.closest(GROUP)
+
+      if (!group?.closest(THREAD) || !replyOf(group).blocks.some(b => b.contains(el))) return null
+
+      return { scope: group, index: () => replyOf(group).index() }
+    }
+
+    /** The selection under (x, y) inside one reply or one card, if any. */
     function selectionAt(x, y) {
       const sel = window.getSelection()
 
       if (!sel || sel.isCollapsed || !sel.rangeCount) return null
       const range = sel.getRangeAt(0)
-      const start = range.commonAncestorContainer
-      const startEl = start.nodeType === Node.ELEMENT_NODE ? start : start.parentElement
-      const root = startEl?.closest(`${THREAD}, [${PAGE_ATTR}]`)
+      const root = textRoot(range.startContainer)
 
-      if (!root || startEl.closest('[contenteditable], textarea, input')) return null
+      if (!root || !root.scope.contains(range.endContainer)) return null
 
-      return rectHit(range, x, y) ? { sel, range, root } : null
+      return rangeHit(range, x, y) ? { sel, range, ...root } : null
     }
 
     // The app's window-level contextmenu handler opens its own menu (just
@@ -1131,8 +1094,8 @@ export default {
         const hit = selectionAt(e.clientX, e.clientY)
 
         if (!hit) return
-        const { sel, range, root } = hit
-        const idx = buildIndex(root)
+        const { sel, range } = hit
+        const idx = hit.index()
         const [s, t] = snapSpan(
           idx.text,
           indexAt(idx, range.startContainer, range.startOffset),
@@ -1146,10 +1109,11 @@ export default {
         e.stopPropagation()
         sel.removeAllRanges()
         sel.addRange(snapped)
-        // Read after re-selecting: the selection's text keeps line breaks.
-        const quote = sel.toString().trim().replace(/\n{3,}/g, '\n\n')
-
-        openAsk({ quote, range: snapped.cloneRange(), parentId: root.getAttribute(PAGE_ATTR), anchor: anchorFor(idx, s, t) })
+        openAsk({
+          quote: quoteOf(idx, s, t),
+          range: snapped.cloneRange(),
+          hint: { prefix: idx.text.slice(Math.max(0, s - CONTEXT_CHARS), s), suffix: idx.text.slice(t, t + CONTEXT_CHARS) }
+        })
       },
       true
     )
@@ -1162,9 +1126,10 @@ export default {
           trackFocus()
           if (lastFocus.stored !== before) {
             closeAsk()
-            closeCards(0)
+            dropCards(0)
           }
           schedulePaint()
+          pumpSoon()
         })
       )
     }
@@ -1175,11 +1140,17 @@ export default {
       cancelOpen()
       cancelClose()
       if (moveFrame) cancelAnimationFrame(moveFrame)
-      // Only ours: during a reload the next copy may have registered these names already.
+      cancelAnimationFrame(readyFrame)
+      cancelAnimationFrame(pumpFrame)
+      document.documentElement.style.removeProperty('--hm-ready-a')
+      for (const a of asks) a.cancel?.()
+      // Only ours: during a reload the next copy may have taken these over already.
       for (const name of HL) if (CSS.highlights.get(name) === hl[name]) CSS.highlights.delete(name)
+      for (const group of document.querySelectorAll(`[${TURN_ATTR}="${instance}"]`)) group.removeAttribute(TURN_ATTR)
       document.documentElement.classList.remove('hm-hover')
       layer.remove()
       style.remove()
+      ticks.remove()
     })
 
     paint()
