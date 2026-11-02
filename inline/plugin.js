@@ -721,16 +721,19 @@ export default {
       }
     }
 
-    // A frame later, so the app has re-rendered for whatever changed: its
-    // message box acts on its last render and would still see the old state.
-    let pumpFrame = 0
+    // Once the app has re-rendered for whatever changed: its message box acts
+    // on its last render and would still see the old state. A timer, not an
+    // animation frame: a window behind other windows draws no frames, and the
+    // prompt would wait until someone looked at it.
+    let pumpPending = false
 
     function pumpSoon() {
-      cancelAnimationFrame(pumpFrame)
-      pumpFrame = requestAnimationFrame(() => {
-        pumpFrame = 0
+      if (pumpPending) return
+      pumpPending = true
+      ctx.setTimeout(() => {
+        pumpPending = false
         pump()
-      })
+      }, 0)
     }
 
     // A chat going idle settles its links (no reply came = no answer) and
@@ -1179,7 +1182,6 @@ export default {
       cancelClose()
       if (moveFrame) cancelAnimationFrame(moveFrame)
       cancelAnimationFrame(readyFrame)
-      cancelAnimationFrame(pumpFrame)
       document.documentElement.style.removeProperty('--hm-ready-a')
       for (const a of asks) a.cancel?.()
       // Only ours: during a reload the next copy may have taken these over already.
