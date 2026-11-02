@@ -1,8 +1,8 @@
 /**
  * Inline: select a passage in a reply, click the comment icon that appears
  * by it, and write a prompt. The passage becomes a link; hover it and the
- * agent's answer opens in a card at the passage. Links inside a card open
- * their own cards.
+ * agent's answer opens in a card at the passage, with any other comments on
+ * the same words. Links inside a card open their own cards.
  *
  * Inline only changes how the chat is shown. A prompt is sent through the
  * message box as an ordinary quote-reply ("> passage", a blank line, the
@@ -11,8 +11,9 @@
  * quote-reply whose passage appears in an earlier reply is a link, and the
  * reply under it is the link's answer. Inline hides that turn in its own view
  * and shows the answer at the passage instead, so links appear on any device
- * and in any chat that has them. The only thing stored is a hint that tells
- * repeats of the same passage apart.
+ * and in any chat that has them. The only thing stored is a hint for each
+ * comment sent from here: it tells repeats of the same passage apart, and
+ * keeps the comment out of a reopened chat until its passage is drawn.
  *
  * Links are drawn with the CSS Custom Highlight API; the transcript DOM is
  * never modified beyond an attribute on each turn it hides.
@@ -26,8 +27,13 @@ const USER_TEXT = '[data-slot="aui_user-message-text"]'
 const THINKING = '[data-slot="aui_thinking-disclosure"]'
 const STREAMING = '[data-message-streaming="true"]'
 const ALERT = '[data-slot="aui_assistant-message-content"] [role="alert"]'
-const STOPPED = '[data-slot="aui_assistant-message-stopped"]'
-const ASSISTANT = '[data-role="assistant"]'
+// Stopped by the user: the app's "stopped" note under a reply, or the reply it
+// adds when the stop came before anything was shown (src/app/session/hooks/
+// use-message-stream/interrupted-reply.ts).
+const STOPPED = '[data-slot="aui_assistant-message-stopped"], [data-message-id^="assistant-interrupted-"]'
+// A question from the agent, not answered yet / answered.
+const QUESTION = '[data-slot="clarify-inline"]:not([data-clarify-settled])'
+const ANSWERED = '[data-slot="clarify-inline"][data-clarify-settled]'
 // One chat and its own message box (the main one, or a tile).
 const CHAT_SURFACE = '[data-composer-target]'
 const ATTACHMENTS = '[data-slot="composer-attachments"]'
@@ -51,12 +57,13 @@ const POPOVER =
 const CSS_TEXT = `
 [${TURN_ATTR}] { display: none !important; }
 /* Like a commented passage in Google Docs: the words themselves are tinted,
-   in the theme's accent. Grey while the answer is on its way, light once
-   there is a conversation, strong for the one you're on. A tint never
-   reads as a selection (the app selects in yellow in every theme) or as a web
-   link (coloured text). */
+   in the theme's accent, light from the moment there is a conversation and
+   strong for the one you're on. While the answer is on its way the words are
+   also underlined with dots (a shape, so it reads in any theme), and they glow
+   once when it arrives. A tint never reads as a selection (the app selects in
+   yellow in every theme) or as a web link (coloured text). */
 ::highlight(hm-link) { background-color: color-mix(in srgb, var(--ui-accent) 22%, transparent); }
-::highlight(hm-wait) { background-color: color-mix(in srgb, var(--ui-text-tertiary) 22%, transparent); }
+::highlight(hm-wait) { text-decoration: underline dotted var(--ui-accent); text-decoration-thickness: 2px; text-underline-offset: 3px; }
 /* The passage you're on right now: writing its prompt, hovering it, or its card open. */
 ::highlight(hm-draft), ::highlight(hm-open), ::highlight(hm-hover) { background-color: color-mix(in srgb, var(--ui-accent) 34%, transparent); }
 /* A link whose answer just arrived glows once; --hm-ready-a is driven from JS. */
@@ -70,19 +77,20 @@ const CSS_TEXT = `
 @media (prefers-reduced-motion: reduce) { .hm-card, .hm-ask { animation: none; } }
 .hm-card { width: 440px; display: flex; flex-direction: column; padding: 10px 0 4px; }
 /* Same shape as the app's activity rows ("Searched …"): codicon + muted text. */
-.hm-card-question { display: flex; align-items: center; gap: 6px; padding: 0 14px 8px; font-size: 0.8125rem; line-height: 1.4;
+.hm-card-question { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 0.8125rem; line-height: 1.4;
   color: var(--ui-text-tertiary); }
 .hm-card-question .codicon { flex: none; font-size: 14px; }
 .hm-card-question-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hm-card-body { max-height: min(50vh, 420px); overflow-y: auto; padding: 0 14px; scrollbar-width: thin; }
 .hm-card-body .aui-md + .aui-md { margin-top: var(--paragraph-gap, 0.75em); }
+/* Comments on the same words, newest first. */
+.hm-card-entry + .hm-card-entry { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--ui-stroke-tertiary); }
 .hm-card-wait { height: 2px; margin: 10px 0 12px; border-radius: 1px;
   background: linear-gradient(90deg, transparent, var(--ui-accent), transparent) no-repeat;
   background-size: 40% 100%; animation: hm-wait 1.1s ease-in-out infinite; }
 @keyframes hm-wait { from { background-position: -60% 0; } to { background-position: 160% 0; } }
 .hm-card-note { padding: 6px 0 4px; font-size: 12px; color: var(--ui-text-tertiary); }
-.hm-card-actions { display: flex; gap: 12px; padding: 4px 14px 2px; }
-.hm-card-actions:empty { display: none; }
+.hm-card-actions { display: flex; gap: 12px; padding: 4px 0 2px; }
 .hm-card-action { all: unset; cursor: pointer; font-size: 11px; line-height: 20px; color: var(--ui-text-tertiary); }
 .hm-card-action:hover { color: var(--ui-text-secondary); }
 /* The way in: a comment icon off the corner where the selection ends. */
@@ -352,9 +360,13 @@ function snapSpan(text, s, t) {
  *  menu, which would make every link blink off while one is open. */
 const shown = el => !el.closest('[inert], [data-pane-hidden]')
 
-/** A reply's own text: its Markdown blocks, not its thinking or tool rows. */
+/**
+ * A reply's own text, in order: its Markdown blocks and any question the agent
+ * asked along the way with the answer it got (part of the same conversation),
+ * not its thinking or tool rows.
+ */
 const answerBlocks = group =>
-  [...group.querySelectorAll('.aui-md')].filter(
+  [...group.querySelectorAll(`.aui-md, ${ANSWERED}`)].filter(
     el => !el.closest(USER_ROOT) && !el.closest(THINKING) && !el.parentElement?.closest('.aui-md')
   )
 
@@ -375,7 +387,7 @@ export default {
     const busy = sid => Boolean(sid && state.busyBySession.get()[sid])
 
     // What the chat holds, read again from the page on every scan.
-    let links = [] // { id, key, text, quote, prompt, group, shown, source, span, answer, userId, status, error, stopped }
+    let links = [] // { id, key, text, quote, prompt, group, shown, source, span, answer, status, error, stopped }
     let linksById = new Map()
     let promptCounts = new Map() // prompt key -> quote-replies with it in the chats, links or not
     const replyCache = new WeakMap() // message group -> { group, blocks, index(), link }, until the group changes
@@ -387,7 +399,7 @@ export default {
     let hovered = null
     // Cards open at their links, deepest last: cards[d] answers a link that
     // sits in the chat (d = 0) or in cards[d - 1].
-    const cards = [] // { link, range, pop, body, actions, pinned, page, idx, sig }
+    const cards = [] // { link, range, pop, body, pinned, pages: [{ link, page, idx }], sig }
 
     const style = document.createElement('style')
     const ticks = document.createElement('style')
@@ -429,20 +441,21 @@ export default {
       return reply
     }
 
-    /** Where a link's answer stands: 'wait', 'done' or 'error', read from its turn. */
-    function stateOf(group, answer, last, rootBusy) {
+    /**
+     * Where a link's answer stands, read from its turn: 'wait' while the agent
+     * is on it, then 'done' with a whole answer or 'none' without one (stopped,
+     * failed, or cut off by another message; any part that came is kept). The
+     * agent is on a chat's last turn for as long as the chat is busy; the
+     * turn's own messages can settle before that (a line written before a tool
+     * call is sealed on its own).
+     */
+    function stateOf(group, answer, last, chatBusy) {
       const text = answer.blocks.some(b => b.textContent.trim())
-      const streaming = Boolean(group.querySelector(STREAMING))
+      const working = Boolean(group.querySelector(STREAMING)) || (last && chatBusy)
       const error = group.querySelector(ALERT)?.textContent.trim() ?? ''
       const stopped = Boolean(group.querySelector(STOPPED))
-      let status = 'error'
 
-      if (text && !streaming) status = 'done'
-      else if (streaming) status = 'wait'
-      // Sent, and the agent hasn't started a reply yet.
-      else if (!error && !stopped && last && rootBusy && !group.querySelector(ASSISTANT)) status = 'wait'
-
-      return { status, error, stopped }
+      return { status: working ? 'wait' : text && !error && !stopped ? 'done' : 'none', error, stopped }
     }
 
     /**
@@ -453,8 +466,11 @@ export default {
     function scan() {
       const found = []
       const counts = new Map()
+      const hiddenIds = [] // message ids of the turns hidden here, for their timeline ticks
       const roots = [...document.querySelectorAll(THREAD)]
       const onScreen = roots.filter(shown)
+      // The chat in front, the only one whose busy state the app tells us.
+      const front = surfaceOf(lastFocus)
 
       for (const root of roots) {
         const groups = root.querySelectorAll(GROUP)
@@ -463,8 +479,10 @@ export default {
         const replies = []
         const answers = []
         const seen = new Map() // prompt key -> times in this chat
-        // Only a lone chat on screen is known to be the focused session.
-        const rootBusy = onScreen.length === 1 && onScreen[0] === root ? busy(lastFocus.runtime) : true
+        // Other chats on screen: a turn counts as worked on while its reply streams.
+        const chatBusy = root.closest(CHAT_SURFACE) === front && busy(lastFocus.runtime)
+        // The app's "Show earlier" button: the start of this chat isn't drawn.
+        const cut = root.firstElementChild?.tagName === 'BUTTON'
 
         groups.forEach((group, i) => {
           const bubble = group.querySelector(USER_TEXT)
@@ -472,6 +490,7 @@ export default {
           const parsed = text ? parseQuoteReply(text) : null
           const reply = replyOf(group)
           let link = null
+          let sent = false // sent through Inline on this Mac
 
           if (parsed) {
             const key = promptKey(parsed.quote, parsed.prompt)
@@ -481,6 +500,7 @@ export default {
 
             seen.set(key, n)
             counts.set(key, (counts.get(key) ?? 0) + 1)
+            sent = key in hints
             if (hit) {
               link = {
                 id: `${n}:${key}`,
@@ -493,17 +513,25 @@ export default {
                 source: earlier[hit.i],
                 span: [hit.at, hit.end],
                 answer: reply,
-                userId: group.querySelector(USER_ROOT)?.dataset.messageId ?? null,
-                ...stateOf(group, reply, i === groups.length - 1, rootBusy)
+                ...stateOf(group, reply, i === groups.length - 1, chatBusy)
               }
               found.push(link)
             }
           }
-          if (link) {
+          // Inline's turns stay out of the chat: one with its link, and one sent
+          // from here while its passage may sit in the part of the chat not
+          // drawn yet (a reopened chat draws only its last turns). A turn whose
+          // agent is waiting on a question stays in, where it can be answered.
+          const inline = Boolean(link) || (sent && cut)
+
+          if (inline && !group.querySelector(QUESTION)) {
             if (group.getAttribute(TURN_ATTR) !== instance) group.setAttribute(TURN_ATTR, instance)
+            const id = group.querySelector(USER_ROOT)?.dataset.messageId
+
+            if (id) hiddenIds.push(id)
           } else if (group.hasAttribute(TURN_ATTR)) group.removeAttribute(TURN_ATTR)
           reply.link = link
-          if (reply.blocks.length) (link ? answers : replies).unshift(reply)
+          if (reply.blocks.length) (inline ? answers : replies).unshift(reply)
         })
       }
 
@@ -526,7 +554,7 @@ export default {
       }
 
       // The timeline's tick for each hidden turn goes too.
-      const tickIds = found.filter(l => l.userId).map(l => `[data-timeline-id="${CSS.escape(l.userId)}"]`)
+      const tickIds = hiddenIds.map(id => `[data-timeline-id="${CSS.escape(id)}"]`)
       const tickCss = tickIds.length ? `${tickIds.join(',\n')} { visibility: hidden; pointer-events: none; }` : ''
 
       if (ticks.textContent !== tickCss) ticks.textContent = tickCss
@@ -545,12 +573,12 @@ export default {
           dropCards(i)
           break
         }
-        cards[i].link = link
-        if (signature(link) !== cards[i].sig) fillCard(cards[i])
+        cards[i].link = sameWords(link).at(-1)
+        if (threadSignature(cards[i].link) !== cards[i].sig) fillCard(cards[i])
       }
 
       anchored = []
-      // Of links on the same passage, the latest wins.
+      // Of links on the same words, the latest is drawn; its card lists them all.
       const taken = new Map()
       const claim = (source, span) => {
         const spans = taken.get(source) ?? new Set()
@@ -568,12 +596,11 @@ export default {
         anchored.push({ link, range: rangeFor(link.source.index(), ...link.span) })
       }
       // A passage in an answer is drawn in that answer's card, when it is open.
-      for (const card of cards) {
-        if (!card.page) continue
-        const idx = (card.idx ??= buildIndex([card.page]))
+      for (const p of cards.flatMap(card => card.pages)) {
+        const idx = (p.idx ??= buildIndex([p.page]))
 
         for (const link of newestFirst) {
-          if (link.source.group !== card.link.group || !claim(link.source, link.span)) continue
+          if (link.source.group !== p.link.group || !claim(link.source, link.span)) continue
           const [s, t] = link.span
 
           if (idx.text.slice(s, t) === link.quote) anchored.push({ link, range: rangeFor(idx, s, t) })
@@ -585,8 +612,8 @@ export default {
       const open = new Set(cards.map(c => c.link.id))
 
       for (const a of anchored) {
-        if (a.ask) hl['hm-wait'].add(a.range)
-        else hl[open.has(a.link.id) ? 'hm-open' : a.link.status === 'done' ? 'hm-link' : 'hm-wait'].add(a.range)
+        hl[a.link && open.has(a.link.id) ? 'hm-open' : 'hm-link'].add(a.range)
+        if (a.ask || a.link.status === 'wait') hl['hm-wait'].add(a.range)
         if (a.link && readyIds.has(a.link.id)) hl['hm-ready'].add(a.range)
       }
       for (const card of cards) card.range = anchored.find(a => a.link?.id === card.link.id)?.range ?? card.range
@@ -667,11 +694,6 @@ export default {
     }
 
     function queueAsk(text, key, range) {
-      if (!lastFocus.runtime) {
-        host.notify({ kind: 'error', message: 'No live session for this chat.' })
-
-        return
-      }
       asks.push({ text, key, range, sid: lastFocus.runtime, stored: lastFocus.stored, sent: false })
       paint()
     }
@@ -703,19 +725,17 @@ export default {
         // Hermes sends whatever is attached in the message box along with a
         // message, so a prompt waits until the box has no attachments.
         if (surfaceOf(next)?.querySelector(ATTACHMENTS)) {
-          if (!next.held) host.notify({ kind: 'info', message: 'Your Inline prompt goes once the attachment in the message box is sent or removed.' })
+          if (!next.held) host.notify({ kind: 'info', message: 'Comment waits until the attachment is sent or removed.' })
           next.held = true
           continue
         }
         const before = promptCounts.get(next.key) ?? 0
 
-        if (!host.composer?.submit(next.sid, next.text)) {
-          // Its chat isn't on screen: it goes when the chat is back.
-          if (next.sid === lastFocus.runtime) dropAsk(next, "Inline couldn't reach this chat's message box.")
-          continue
-        }
+        // Its chat isn't on screen, or is still loading after a switch: the
+        // prompt goes once the chat's message box can take it.
+        if (!host.composer?.submit(next.sid, next.text)) continue
         Object.assign(next, { sent: true, before })
-        next.cancel = ctx.setTimeout(() => dropAsk(next, "Hermes didn't take the prompt."), SEND_TIMEOUT_MS)
+        next.cancel = ctx.setTimeout(() => dropAsk(next, "Comment wasn't sent."), SEND_TIMEOUT_MS)
 
         return
       }
@@ -774,37 +794,62 @@ export default {
       return button
     }
 
-    const signature = link =>
-      `${link.status}|${link.error}|${link.stopped}|${link.answer.blocks.map(b => b.textContent.length).join(',')}`
+    /** Every comment on exactly the same words, in chat order (oldest first). */
+    const sameWords = link =>
+      links.filter(l => l.source === link.source && l.span[0] === link.span[0] && l.span[1] === link.span[1])
 
-    /** The card shows the reply Hermes already drew: a copy of its Markdown. */
+    /** The words' conversation as the card shows it: a comment retried later is shown once, as its retry. */
+    const threadOf = link =>
+      sameWords(link).filter((l, i, all) => l.status !== 'none' || !all.slice(i + 1).some(m => m.key === l.key))
+
+    const threadSignature = link =>
+      threadOf(link)
+        .map(l => `${l.id}|${l.status}|${l.error}|${l.answer.blocks.map(b => b.textContent.length).join(',')}`)
+        .join('/')
+
+    /**
+     * The card shows each comment on the words: its prompt as a quiet label
+     * (the angle the answer was seen from), then the reply Hermes already drew,
+     * as a copy of its Markdown.
+     */
     function fillCard(card) {
-      const { link, body, actions } = card
-      const blocks = link.answer.blocks.filter(b => b.textContent.trim())
+      card.body.replaceChildren()
+      Object.assign(card, { pages: [], sig: threadSignature(card.link) })
+      // Newest first: the comment just made, or the latest reply, on top.
+      for (const link of threadOf(card.link).reverse()) {
+        const entry = element('div', 'hm-card-entry')
+        const question = element('div', 'hm-card-question')
+        const blocks = link.answer.blocks.filter(b => b.textContent.trim())
 
-      body.replaceChildren()
-      actions.replaceChildren()
-      Object.assign(card, { page: null, idx: null, sig: signature(link) })
-      if (blocks.length) {
-        const page = element('div', '')
+        question.title = link.prompt
+        question.append(element('span', 'codicon codicon-comment'), element('span', 'hm-card-question-text', link.prompt))
+        entry.append(question)
+        if (blocks.length) {
+          const page = element('div', '')
 
-        page.setAttribute(PAGE_ATTR, '')
-        page.dataset.selectableText = 'true'
-        for (const block of blocks) page.append(block.cloneNode(true))
-        body.append(page)
-        card.page = page
+          page.setAttribute(PAGE_ATTR, '')
+          page.dataset.selectableText = 'true'
+          for (const block of blocks) page.append(block.cloneNode(true))
+          entry.append(page)
+          card.pages.push({ link, page, idx: null })
+        }
+        if (link.status === 'wait') entry.append(element('div', 'hm-card-wait'))
+        else if (link.status === 'none') {
+          const actions = element('div', 'hm-card-actions')
+
+          // The app's own words say what happened when it has any (an error, or
+          // the reply it writes for a stop); a note only fills an empty answer.
+          if (link.error || !blocks.length) entry.append(element('div', 'hm-card-note', link.error || 'No answer arrived.'))
+          actions.append(
+            action('Retry', () => {
+              closeCards(cards.indexOf(card))
+              queueAsk(link.text, link.key, null)
+            })
+          )
+          entry.append(actions)
+        }
+        card.body.append(entry)
       }
-      if (link.status === 'wait') body.append(element('div', 'hm-card-wait'))
-      else if (link.status === 'error') {
-        body.append(element('div', 'hm-card-note', link.error ? `No answer: ${link.error}` : 'No answer arrived.'))
-        actions.append(
-          action('Retry', () => {
-            closeCards(cards.indexOf(card))
-            queueAsk(link.text, link.key, null)
-          })
-        )
-      } else if (link.error) body.append(element('div', 'hm-card-note', link.error))
-      else if (link.stopped) body.append(element('div', 'hm-card-note', 'Stopped before it finished.'))
       if (card.pop.isConnected) place(card.pop, card.range.getBoundingClientRect())
     }
 
@@ -824,16 +869,9 @@ export default {
       // Hermes's own edge fade (the utility behind FadeScroll): a clipped edge
       // fades out while there is more to scroll, and a short answer shows none.
       const body = element('div', 'hm-card-body scroll-fade-y')
-      const actions = element('div', 'hm-card-actions')
-      const card = { link: hit.link, range: hit.range, pop, body, actions, pinned: false, page: null, idx: null, sig: '' }
+      const card = { link: hit.link, range: hit.range, pop, body, pinned: false, pages: [], sig: '' }
 
-      // The answer is the card; the prompt is the angle it was seen from,
-      // so it sits above it as a quiet label rather than a heading.
-      const question = element('div', 'hm-card-question')
-
-      question.title = hit.link.prompt
-      question.append(element('span', 'codicon codicon-comment'), element('span', 'hm-card-question-text', hit.link.prompt))
-      pop.append(question, body, actions)
+      pop.append(body)
       cards.push(card)
       layer.append(pop)
       fillCard(card)
@@ -927,7 +965,8 @@ export default {
     }
 
     function pointer(x, y, target) {
-      if (ask) return
+      // Writing a prompt, or words selected to comment on: links stay closed.
+      if (ask || !offer.hidden) return cancelOpen()
       const hit = hitAt(x, y)
       const inCard = cards.findLastIndex(c => c.pop.contains(target))
       let keep = inCard + 1
@@ -1114,7 +1153,7 @@ export default {
     let dragging = false
 
     offer.type = 'button'
-    offer.setAttribute('aria-label', 'Ask about the selected words')
+    offer.setAttribute('aria-label', 'Comment on the selected words')
     offer.hidden = true
     offer.append(element('span', 'codicon codicon-comment'))
     layer.append(offer)
@@ -1155,6 +1194,11 @@ export default {
       () => {
         dragging = false
         placeOffer()
+        // Words selected to comment on: the cards not holding them close, so
+        // none covers the icon (or, on a passage with a comment, the passage).
+        const range = offer.hidden ? null : replySelection()?.range
+
+        if (range) closeCards(cards.findLastIndex(c => c.body.contains(range.startContainer)) + 1)
       },
       true
     )
